@@ -77,6 +77,64 @@ struct BlockInner {
     partition: Arc<dyn Partition>,
     io_engine: Arc<dyn IoEngine>,
     statistics: Arc<BlockStatistics>,
+    /// End of the furthest write into the partition.
+    written: AtomicUsize,
+    /// Sum of `written` over the blocks of one engine.
+    allocated: Arc<AtomicUsize>,
+}
+
+impl BlockInner {
+    fn new(
+        id: BlockId,
+        partition: Arc<dyn Partition>,
+        io_engine: Arc<dyn IoEngine>,
+        allocated: Arc<AtomicUsize>,
+    ) -> Self {
+        let written = written_extent(partition.as_ref());
+        allocated.fetch_add(written, Ordering::Relaxed);
+        Self {
+            id,
+            partition,
+            io_engine,
+            statistics: Arc::<BlockStatistics>::default(),
+            written: AtomicUsize::new(written),
+            allocated,
+        }
+    }
+}
+
+/// End of the last data extent the filesystem holds for the partition.
+///
+/// Blocks are written sequentially from their start and never deallocated, so this is the allocation a previous
+/// process left behind.
+#[cfg(target_family = "unix")]
+fn written_extent(partition: &dyn Partition) -> usize {
+    let (file, base) = partition.translate(0);
+    let end = base + partition.size() as u64;
+    let mut written = 0;
+    let mut position = base;
+    while position < end {
+        // SAFETY: `lseek` only reads the descriptor the partition keeps open.
+        let data = unsafe { libc::lseek(file.0, position as libc::off_t, libc::SEEK_DATA) };
+        if data < 0 || data as u64 >= end {
+            break;
+        }
+        // SAFETY: as above.
+        let hole = unsafe { libc::lseek(file.0, data, libc::SEEK_HOLE) };
+        if hole < 0 {
+            break;
+        }
+        let hole = (hole as u64).min(end);
+        written = (hole - base) as usize;
+        position = hole;
+    }
+    written
+}
+
+/// Without extent queries every block is assumed fully written.
+#[cfg(not(target_family = "unix"))]
+fn written_extent(partition: &dyn Partition) -> usize {
+    partition.size()
 }
 
 /// A block is a logical partition of a device. It is used to manage the device's storage space.
@@ -102,11 +160,18 @@ impl Block {
     }
 
     pub(crate) async fn write(&self, buf: Box<dyn IoBuf>, offset: u64) -> (Box<dyn IoB>, Result<()>) {
+        let end = offset as usize + buf.len();
         let (buf, res) = self
             .inner
             .io_engine
             .write(buf, self.inner.partition.as_ref(), offset)
             .await;
+        if res.is_ok() {
+            let previous = self.inner.written.fetch_max(end, Ordering::Relaxed);
+            if end > previous {
+                self.inner.allocated.fetch_add(end - previous, Ordering::Relaxed);
+            }
+        }
         (buf, res)
     }
 
@@ -127,13 +192,7 @@ impl Block {
 #[cfg(test)]
 impl Block {
     pub(crate) fn new_for_test(id: BlockId, partition: Arc<dyn Partition>, io_engine: Arc<dyn IoEngine>) -> Self {
-        let inner = BlockInner {
-            id,
-            partition,
-            io_engine,
-            statistics: Arc::<BlockStatistics>::default(),
-        };
-        let inner = Arc::new(inner);
+        let inner = Arc::new(BlockInner::new(id, partition, io_engine, Arc::default()));
         Self { inner }
     }
 }
@@ -163,6 +222,7 @@ struct Inner {
     clean_block_threshold: usize,
     metrics: Arc<Metrics>,
     spawner: Spawner,
+    allocated: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +244,7 @@ impl BlockManager {
         spawner: Spawner,
     ) -> Result<Self> {
         let mut blocks = vec![];
+        let allocated = Arc::<AtomicUsize>::default();
 
         while device.free() >= block_size {
             let partition = match device.create_partition(block_size) {
@@ -193,12 +254,7 @@ impl BlockManager {
             };
             let id = blocks.len() as BlockId;
             let block = Block {
-                inner: Arc::new(BlockInner {
-                    id,
-                    partition,
-                    io_engine: io_engine.clone(),
-                    statistics: Arc::<BlockStatistics>::default(),
-                }),
+                inner: Arc::new(BlockInner::new(id, partition, io_engine.clone(), allocated.clone())),
             };
             blocks.push(block);
         }
@@ -227,10 +283,16 @@ impl BlockManager {
             clean_block_threshold,
             metrics,
             spawner,
+            allocated,
         };
         let inner = Arc::new(inner);
         let this = Self { inner };
         Ok(this)
+    }
+
+    /// Filesystem allocation of all blocks: the written extent of each, including padding and obsolete records.
+    pub fn allocated_bytes(&self) -> usize {
+        self.inner.allocated.load(Ordering::Relaxed)
     }
 
     pub fn init(&self, clean_blocks: &[BlockId]) {

@@ -31,6 +31,7 @@ use crate::{
         flusher::{Flusher, Submission},
         indexer::Indexer,
         manager::{Block, ReclaimingBlock},
+        observer::DepartureReason,
         scanner::BlockScanner,
         serde::Sequence,
     },
@@ -158,7 +159,7 @@ where
                         });
                         picked_count += 1;
                     } else {
-                        unpicked.push((info.hash, info.addr.sequence));
+                        unpicked.push((info.hash, info.addr));
                     }
                 }
             }
@@ -169,7 +170,10 @@ where
             spawner.spawn(async move {
                 join_all(waits).await;
             });
-            indexer.remove_batch(unpicked);
+            indexer.remove_addresses(
+                unpicked.iter().map(|(hash, addr)| (*hash, addr)),
+                DepartureReason::Reclaim,
+            );
 
             if let Err(e) = BlockCleaner::clean(&block).await {
                 tracing::warn!("reclaimer]: mark block {id} clean error: {e}", id = block.id());

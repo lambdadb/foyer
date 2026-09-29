@@ -56,6 +56,7 @@ use crate::{
         block::{
             eviction::{EvictionPicker, FifoPicker, InvalidRatioPicker},
             manager::{BlockId, BlockManager},
+            observer::{DepartureReason, EntryObserver},
             reclaimer::{BlockCleaner, Reclaimer, ReclaimerTrait},
             serde::{AtomicSequence, EntryHeader},
             tombstone::{Tombstone, TombstoneLog},
@@ -100,6 +101,7 @@ where
     flush_switch: Switch,
     #[cfg(any(test, feature = "test_utils"))]
     load_holder: Holder,
+    entry_observer: Option<Arc<dyn EntryObserver>>,
     marker: PhantomData<(K, V, P)>,
 }
 
@@ -126,6 +128,7 @@ where
             .field("admission_filter", &self.admission_filter)
             .field("reinsertion_filter", &self.reinsertion_filter)
             .field("enable_tombstone_log", &self.enable_tombstone_log)
+            .field("entry_observer", &self.entry_observer)
             .finish()
     }
 }
@@ -158,6 +161,7 @@ where
             flush_switch: Switch::default(),
             #[cfg(any(test, feature = "test_utils"))]
             load_holder: Holder::default(),
+            entry_observer: None,
             marker: PhantomData,
         }
     }
@@ -306,6 +310,14 @@ where
         self
     }
 
+    /// Set the observer of entry departures and recovery outcomes.
+    ///
+    /// Default: none.
+    pub fn with_entry_observer(mut self, observer: Arc<dyn EntryObserver>) -> Self {
+        self.entry_observer = Some(observer);
+        self
+    }
+
     /// Pass the flush holder for test.
     #[cfg(any(test, feature = "test_utils"))]
     pub fn with_flush_switch(mut self, flush_switch: Switch) -> Self {
@@ -355,7 +367,7 @@ where
             None
         };
 
-        let indexer = Indexer::new(self.indexer_shards);
+        let indexer = Indexer::new(self.indexer_shards, self.entry_observer.clone());
         let submit_queue_size = Arc::<AtomicUsize>::default();
 
         #[expect(clippy::type_complexity)]
@@ -407,6 +419,7 @@ where
             &tombstones,
             runtime.clone(),
             metrics.clone(),
+            self.entry_observer.as_ref(),
         )
         .await?;
 
@@ -655,7 +668,7 @@ where
                                 ?e,
                                 "[block engine load]: deserialize read buffer raise error, remove this entry and skip"
                             );
-                            indexer.remove(hash);
+                            indexer.remove(hash, &addr, DepartureReason::ReadCorruption);
                             Ok(Load::Miss)
                         }
                         _ => {
@@ -686,7 +699,7 @@ where
                                     ?e,
                                     "[block engine load]: deserialize read buffer raise error, remove this entry and skip"
                                 );
-                                indexer.remove(hash);
+                                indexer.remove(hash, &addr, DepartureReason::ReadCorruption);
                                 Ok(Load::Miss)
                             }
                             _ => {
@@ -834,6 +847,14 @@ where
         self.destroy()
     }
 
+    fn entry_payload_bytes(&self) -> usize {
+        self.inner.indexer.payload_bytes()
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.inner.block_manager.allocated_bytes()
+    }
+
     fn wait(&self) -> BoxFuture<'static, ()> {
         // TODO(MrCroxx): refactor this.
         self.wait().boxed()
@@ -857,7 +878,10 @@ mod tests {
     use super::*;
     use crate::{
         PsyncIoEngineConfig, RejectAll,
-        engine::RecoverMode,
+        engine::{
+            RecoverMode,
+            block::observer::{Departure, RecoveryReport},
+        },
         io::{
             device::{DeviceBuilder, combined::CombinedDeviceBuilder, fs::FsDeviceBuilder},
             engine::{IoEngine, IoEngineBuildContext, IoEngineConfig},
@@ -914,6 +938,7 @@ mod tests {
             eviction_pickers: vec![Box::<FifoPicker>::default()],
             reinsertion_filter,
             enable_tombstone_log: false,
+            entry_observer: None,
             buffer_pool_size: 16 * 1024 * 1024,
             blob_index_size: 4 * 1024,
             submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
@@ -957,6 +982,7 @@ mod tests {
             admission_filter: StorageFilter::new(),
             reinsertion_filter: StorageFilter::new().with_condition(RejectAll),
             enable_tombstone_log: true,
+            entry_observer: None,
             buffer_pool_size: 16 * 1024 * 1024,
             blob_index_size: 4 * 1024,
             submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
@@ -1402,5 +1428,313 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(engine.inner.block_manager.blocks(), (1 + 2 + 4) * MB / (64 * KB));
+    }
+
+    #[derive(Debug, Default)]
+    struct Recorder {
+        departures: parking_lot::Mutex<Vec<Departure>>,
+        recoveries: parking_lot::Mutex<Vec<RecoveryReport>>,
+    }
+
+    impl EntryObserver for Recorder {
+        fn on_departure(&self, departure: Departure) {
+            self.departures.lock().push(departure);
+        }
+
+        fn on_recovery(&self, report: RecoveryReport) {
+            self.recoveries.lock().push(report);
+        }
+    }
+
+    impl Recorder {
+        fn take(&self) -> Vec<(u64, DepartureReason)> {
+            std::mem::take(&mut *self.departures.lock())
+                .into_iter()
+                .map(|departure| (departure.hash, departure.reason))
+                .collect()
+        }
+    }
+
+    /// Same shape as [`store_for_test_with_reinsertion_filter`], observed.
+    async fn engine_with_observer(
+        dir: impl AsRef<Path>,
+        observer: Arc<Recorder>,
+        enable_tombstone_log: bool,
+        reinsertion_filter: StorageFilter,
+    ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
+        let tombstone = if enable_tombstone_log { 4 * KB } else { 0 };
+        let device = FsDeviceBuilder::new(dir)
+            .with_capacity(64 * KB + tombstone)
+            .build()
+            .unwrap();
+        let spawner = Spawner::current();
+        let io_engine = io_engine_for_test(spawner.clone()).await;
+        let builder = BlockEngineConfig {
+            device,
+            block_size: 16 * KB,
+            compression: Compression::None,
+            indexer_shards: 4,
+            recover_concurrency: 2,
+            flushers: 1,
+            reclaimers: 1,
+            clean_block_threshold: 1,
+            admission_filter: StorageFilter::new(),
+            eviction_pickers: vec![Box::<FifoPicker>::default()],
+            reinsertion_filter,
+            enable_tombstone_log,
+            entry_observer: Some(observer),
+            buffer_pool_size: 16 * 1024 * 1024,
+            blob_index_size: 4 * KB,
+            submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
+            flush_switch: Switch::default(),
+            load_holder: Holder::default(),
+            marker: PhantomData,
+        };
+        Box::new(builder)
+            .build(EngineBuildContext {
+                io_engine,
+                metrics: Arc::new(Metrics::noop()),
+                spawner,
+                recover_mode: RecoverMode::Quiet,
+            })
+            .await
+            .unwrap()
+    }
+
+    fn assert_payload_matches_index(store: &BlockEngine<u64, Vec<u8>, TestProperties>) {
+        assert_eq!(store.entry_payload_bytes(), store.inner.indexer.indexed_payload_bytes());
+    }
+
+    fn payload(store: &BlockEngine<u64, Vec<u8>, TestProperties>, hash: u64) -> usize {
+        store.inner.indexer.get(hash).unwrap().payload()
+    }
+
+    /// Flips one byte inside the only on-disk copy of `needle`.
+    fn corrupt(dir: &Path, needle: &[u8]) {
+        let mut found = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.is_file() {
+                continue;
+            }
+            let mut bytes = std::fs::read(&path).unwrap();
+            if let Some(position) = bytes.windows(needle.len()).position(|window| window == needle) {
+                bytes[position + needle.len() / 2] ^= 0x40;
+                std::fs::write(&path, bytes).unwrap();
+                found += 1;
+            }
+        }
+        assert_eq!(found, 1, "exactly one persisted copy");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_payload_gauge_follows_entry_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = cache_for_test();
+        let recorder = Arc::new(Recorder::default());
+        let store = engine_with_observer(
+            dir.path(),
+            recorder.clone(),
+            false,
+            StorageFilter::new().with_condition(RejectAll),
+        )
+        .await;
+        let hash = |key: u64| memory.hash(&key);
+
+        // Enqueued entries count only once flushed; an entry larger than a block is never accepted.
+        store.hold_flush();
+        enqueue(&store, memory.insert(1, vec![1; 7 * KB]));
+        enqueue(&store, memory.insert(2, vec![2; 3 * KB]));
+        enqueue(&store, memory.insert(3, vec![3; 17 * KB]));
+        assert_eq!(store.entry_payload_bytes(), 0);
+        store.unhold_flush();
+        store.wait().await;
+        let p1 = payload(&store, hash(1));
+        let p2 = payload(&store, hash(2));
+        assert!(
+            (7 * KB..7 * KB + 64).contains(&p1),
+            "payload {p1} excludes header and padding"
+        );
+        assert!(store.inner.indexer.get(hash(3)).is_none());
+        assert_eq!(store.entry_payload_bytes(), p1 + p2);
+        assert_payload_matches_index(&store);
+        assert!(recorder.take().is_empty());
+
+        // Replacement.
+        let e1v2 = vec![!1; 2 * KB];
+        enqueue(&store, memory.insert(1, e1v2.clone()));
+        store.wait().await;
+        let p1v2 = payload(&store, hash(1));
+        assert_eq!(store.entry_payload_bytes(), p1v2 + p2);
+        assert_eq!(recorder.take(), vec![(hash(1), DepartureReason::Replacement)]);
+
+        // Explicit delete, repeated.
+        store.delete(hash(2));
+        store.delete(hash(2));
+        store.wait().await;
+        assert_eq!(store.entry_payload_bytes(), p1v2);
+        assert_eq!(recorder.take(), vec![(hash(2), DepartureReason::ExplicitDelete)]);
+
+        // Read-time corruption.
+        corrupt(dir.path(), &e1v2);
+        assert!(store.load(hash(1)).await.unwrap().kv().is_none());
+        assert_eq!(store.entry_payload_bytes(), 0);
+        assert_eq!(recorder.take(), vec![(hash(1), DepartureReason::ReadCorruption)]);
+
+        // Destroy.
+        enqueue(&store, memory.insert(4, vec![4; 3 * KB]));
+        store.wait().await;
+        store.destroy().await.unwrap();
+        assert_eq!(store.entry_payload_bytes(), 0);
+        assert_eq!(recorder.take(), vec![(hash(4), DepartureReason::ExplicitDelete)]);
+    }
+
+    #[cfg(target_family = "unix")]
+    fn filesystem_allocated(dir: &Path) -> usize {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.blocks() as usize * 512)
+            .sum()
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test_log::test(tokio::test)]
+    async fn test_allocated_bytes_follow_filesystem_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = cache_for_test();
+        let open = || {
+            engine_with_observer(
+                dir.path(),
+                Arc::new(Recorder::default()),
+                false,
+                StorageFilter::new().with_condition(RejectAll),
+            )
+        };
+        let store = open().await;
+        assert_eq!(store.allocated_bytes(), 0);
+        assert_eq!(filesystem_allocated(dir.path()), 0);
+
+        enqueue(&store, memory.insert(1, vec![1; 7 * KB]));
+        enqueue(&store, memory.insert(2, vec![2; 3 * KB]));
+        store.wait().await;
+        let allocated = store.allocated_bytes();
+        assert!(allocated >= store.entry_payload_bytes() + 2 * EntryHeader::serialized_len());
+        assert_eq!(allocated, filesystem_allocated(dir.path()));
+
+        // Replacing an entry leaves the obsolete record allocated.
+        enqueue(&store, memory.insert(1, vec![!1; 2 * KB]));
+        store.wait().await;
+        let allocated = store.allocated_bytes();
+        assert_eq!(allocated, filesystem_allocated(dir.path()));
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = open().await;
+        assert_eq!(store.allocated_bytes(), allocated);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_payload_gauge_follows_reclaim_and_relocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = cache_for_test();
+        let recorder = Arc::new(Recorder::default());
+        let store = engine_with_observer(
+            dir.path(),
+            recorder.clone(),
+            false,
+            StorageFilter::new().with_condition(Biased::new(vec![memory.hash(&1)])),
+        )
+        .await;
+        let es = (0..11).map(|i| memory.insert(i, vec![i as u8; 3 * KB])).collect_vec();
+
+        // [[0, 1, 2], [3, 4, 5], [6, 7, 8], []]
+        for e in es.iter().take(9).cloned() {
+            enqueue(&store, e);
+            store.wait().await;
+        }
+        let before = store.entry_payload_bytes();
+        let p0 = payload(&store, memory.hash(&0));
+        let p2 = payload(&store, memory.hash(&2));
+
+        // Reclaiming the first block drops 0 and 2 and relocates 1: [[], [3, 4, 5], [6, 7, 8], [9, 10, 1]]
+        enqueue(&store, es[9].clone());
+        enqueue(&store, es[10].clone());
+        store.wait().await;
+        let mut departures = recorder.take();
+        departures.sort();
+        let mut expected = vec![
+            (memory.hash(&0), DepartureReason::Reclaim),
+            (memory.hash(&2), DepartureReason::Reclaim),
+        ];
+        expected.sort();
+        assert_eq!(departures, expected);
+        assert!(store.load(memory.hash(&1)).await.unwrap().kv().is_some());
+        assert_eq!(
+            store.entry_payload_bytes(),
+            before - p0 - p2 + payload(&store, memory.hash(&9)) + payload(&store, memory.hash(&10))
+        );
+        assert_payload_matches_index(&store);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_recovery_restores_only_live_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = cache_for_test();
+        let recorder = Arc::new(Recorder::default());
+        let store = engine_with_observer(
+            dir.path(),
+            recorder.clone(),
+            true,
+            StorageFilter::new().with_condition(RejectAll),
+        )
+        .await;
+        assert_eq!(*recorder.recoveries.lock(), vec![RecoveryReport::default()]);
+
+        for (key, value) in [
+            (1, vec![1; 3 * KB]),
+            (1, vec![!1; 2 * KB]),
+            (2, vec![2; 3 * KB]),
+            (3, vec![3; 3 * KB]),
+        ] {
+            enqueue(&store, memory.insert(key, value));
+            store.wait().await;
+        }
+        store.delete(memory.hash(&3));
+        store.wait().await;
+        let live = store.entry_payload_bytes();
+        recorder.take();
+        store.close().await.unwrap();
+        drop(store);
+
+        let recorder = Arc::new(Recorder::default());
+        let store = engine_with_observer(
+            dir.path(),
+            recorder.clone(),
+            true,
+            StorageFilter::new().with_condition(RejectAll),
+        )
+        .await;
+        assert_eq!(store.entry_payload_bytes(), live);
+        assert_payload_matches_index(&store);
+        assert_eq!(
+            *recorder.recoveries.lock(),
+            vec![RecoveryReport {
+                restored_entries: 2,
+                restored_payload_bytes: live,
+                discarded_records: 2,
+                corrupt_blocks: 0,
+            }]
+        );
+        let mut departures = recorder.take();
+        departures.sort();
+        let mut expected = vec![
+            (memory.hash(&1), DepartureReason::RecoveryDiscard),
+            (memory.hash(&3), DepartureReason::RecoveryDiscard),
+        ];
+        expected.sort();
+        assert_eq!(departures, expected);
     }
 }

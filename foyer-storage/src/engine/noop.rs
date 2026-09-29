@@ -145,6 +145,14 @@ where
         async move { Ok(()) }.boxed()
     }
 
+    fn entry_payload_bytes(&self) -> usize {
+        0
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        0
+    }
+
     fn wait(&self) -> BoxFuture<'static, ()> {
         async move {}.boxed()
     }

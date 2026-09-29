@@ -185,6 +185,14 @@ where
     /// Delete all cached entries of the disk cache.
     fn destroy(&self) -> BoxFuture<'static, Result<()>>;
 
+    /// Serialized key and value bytes of the entries the disk cache currently holds.
+    ///
+    /// Excludes entry headers, alignment padding, obsolete records and entries still waiting to be flushed.
+    fn entry_payload_bytes(&self) -> usize;
+
+    /// Filesystem allocation of the disk cache data, including entry headers, alignment padding and obsolete records.
+    fn allocated_bytes(&self) -> usize;
+
     /// Wait for the ongoing flush and reclaim tasks to finish.
     fn wait(&self) -> BoxFuture<'static, ()>;
 

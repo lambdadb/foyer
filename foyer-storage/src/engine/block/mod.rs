@@ -18,6 +18,7 @@ pub mod eviction;
 pub mod flusher;
 pub mod indexer;
 pub mod manager;
+pub mod observer;
 pub mod reclaimer;
 pub mod recover;
 pub mod scanner;

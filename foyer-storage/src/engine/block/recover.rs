@@ -33,6 +33,7 @@ use crate::engine::{
     block::{
         indexer::HashedEntryAddress,
         manager::{Block, BlockId, BlockManager},
+        observer::{Departure, DepartureReason, EntryObserver, RecoveryReport},
         scanner::{BlockScanner, EntryInfo},
         serde::{AtomicSequence, Sequence},
         tombstone::Tombstone,
@@ -55,6 +56,7 @@ impl RecoverRunner {
         tombstones: &[Tombstone],
         spawner: Spawner,
         metrics: Arc<Metrics>,
+        observer: Option<&Arc<dyn EntryObserver>>,
     ) -> Result<()> {
         let now = Instant::now();
 
@@ -91,21 +93,33 @@ impl RecoverRunner {
         let mut clean_blocks = vec![];
         let mut evictable_blocks = vec![];
 
+        let mut discarded = vec![];
+        let mut corrupt_blocks = 0;
         let mut insert_or_update =
             |hash: u64, sequence: Sequence, addr: EntryAddressOrTombstone| match indices.entry(hash) {
                 Entry::Occupied(mut entry) => {
                     let (latest, latest_addr) = entry.get_mut();
-                    if sequence >= *latest {
+                    let stale = if sequence >= *latest {
                         *latest = sequence;
-                        *latest_addr = addr;
+                        std::mem::replace(latest_addr, addr)
+                    } else {
+                        addr
+                    };
+                    if let EntryAddressOrTombstone::EntryAddress(address) = stale {
+                        discarded.push(Departure {
+                            hash,
+                            payload_bytes: address.payload(),
+                            reason: DepartureReason::RecoveryDiscard,
+                        });
                     }
                 }
                 Entry::Vacant(entry) => {
                     entry.insert((sequence, addr));
                 }
             };
-        for (block, infos) in total.into_iter().map(|r| r.unwrap()).enumerate() {
+        for (block, (infos, corrupt)) in total.into_iter().map(|r| r.unwrap()).enumerate() {
             let block = block as BlockId;
+            corrupt_blocks += usize::from(corrupt);
 
             if infos.is_empty() {
                 clean_blocks.push(block);
@@ -142,6 +156,13 @@ impl RecoverRunner {
             s = latest_sequence,
         );
 
+        let report = RecoveryReport {
+            restored_entries: indices.len(),
+            restored_payload_bytes: indices.iter().map(|haddr| haddr.address.payload()).sum(),
+            discarded_records: discarded.len(),
+            corrupt_blocks,
+        };
+
         // Update components.
         indexer.insert_batch(indices);
         sequence.store(latest_sequence + 1, Ordering::Release);
@@ -154,6 +175,13 @@ impl RecoverRunner {
             .storage_block_engine_recover_duration
             .record(elapsed.as_secs_f64());
 
+        if let Some(observer) = observer {
+            discarded
+                .into_iter()
+                .for_each(|departure| observer.on_departure(departure));
+            observer.on_recovery(report);
+        }
+
         Ok(())
     }
 }
@@ -162,12 +190,14 @@ impl RecoverRunner {
 struct BlockRecoverRunner;
 
 impl BlockRecoverRunner {
-    async fn run(mode: RecoverMode, block: Block, blob_index_size: usize) -> Result<Vec<EntryInfo>> {
+    /// Returns the recovered entries and whether the scan stopped at a corrupt blob.
+    async fn run(mode: RecoverMode, block: Block, blob_index_size: usize) -> Result<(Vec<EntryInfo>, bool)> {
         if mode == RecoverMode::None {
-            return Ok(vec![]);
+            return Ok((vec![], false));
         }
 
         let mut recovered = vec![];
+        let mut corrupt = false;
 
         let id = block.id();
         let mut iter = BlockScanner::new(block, blob_index_size);
@@ -181,6 +211,7 @@ impl BlockRecoverRunner {
                         return Err(e);
                     } else {
                         tracing::warn!("error raised when recovering block {id}, skip further recovery for {id}.");
+                        corrupt = true;
                         break;
                     }
                 }
@@ -194,6 +225,6 @@ impl BlockRecoverRunner {
             }
         }
 
-        Ok(recovered)
+        Ok((recovered, corrupt))
     }
 }

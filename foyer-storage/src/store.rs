@@ -272,6 +272,20 @@ where
         self.inner.engine.destroy().await
     }
 
+    /// Serialized key and value bytes of the entries the disk cache currently holds.
+    ///
+    /// See [`Engine::entry_payload_bytes`].
+    pub fn entry_payload_bytes(&self) -> usize {
+        self.inner.engine.entry_payload_bytes()
+    }
+
+    /// Filesystem allocation of the disk cache data.
+    ///
+    /// See [`Engine::allocated_bytes`].
+    pub fn allocated_bytes(&self) -> usize {
+        self.inner.engine.allocated_bytes()
+    }
+
     /// Get the device of the disk cache.
     pub fn device(&self) -> &Arc<dyn Device> {
         self.inner.engine.device()
