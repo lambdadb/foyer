@@ -95,6 +95,7 @@ impl RecoverRunner {
 
         let mut discarded = vec![];
         let mut corrupt_blocks = 0;
+        let mut truncated_records = 0;
         let mut insert_or_update =
             |hash: u64, sequence: Sequence, addr: EntryAddressOrTombstone| match indices.entry(hash) {
                 Entry::Occupied(mut entry) => {
@@ -117,9 +118,10 @@ impl RecoverRunner {
                     entry.insert((sequence, addr));
                 }
             };
-        for (block, (infos, corrupt)) in total.into_iter().map(|r| r.unwrap()).enumerate() {
+        for (block, (infos, corrupt, truncated)) in total.into_iter().map(|r| r.unwrap()).enumerate() {
             let block = block as BlockId;
             corrupt_blocks += usize::from(corrupt);
+            truncated_records += truncated;
 
             if infos.is_empty() {
                 clean_blocks.push(block);
@@ -160,6 +162,7 @@ impl RecoverRunner {
             restored_entries: indices.len(),
             restored_payload_bytes: indices.iter().map(|haddr| haddr.address.payload()).sum(),
             discarded_records: discarded.len(),
+            truncated_records,
             corrupt_blocks,
         };
 
@@ -190,14 +193,16 @@ impl RecoverRunner {
 struct BlockRecoverRunner;
 
 impl BlockRecoverRunner {
-    /// Returns the recovered entries and whether the scan stopped at a corrupt blob.
-    async fn run(mode: RecoverMode, block: Block, blob_index_size: usize) -> Result<(Vec<EntryInfo>, bool)> {
+    /// Returns the recovered entries, whether the scan stopped at a corrupt blob, and how many records it found behind
+    /// a lower sequence and did not recover.
+    async fn run(mode: RecoverMode, block: Block, blob_index_size: usize) -> Result<(Vec<EntryInfo>, bool, usize)> {
         if mode == RecoverMode::None {
-            return Ok((vec![], false));
+            return Ok((vec![], false, 0));
         }
 
         let mut recovered = vec![];
         let mut corrupt = false;
+        let mut truncated = 0;
 
         let id = block.id();
         let mut iter = BlockScanner::new(block, blob_index_size);
@@ -218,13 +223,19 @@ impl BlockRecoverRunner {
             };
 
             for info in infos {
-                if info.addr.sequence < recovered.last().map(|last: &EntryInfo| last.addr.sequence).unwrap_or(0) {
-                    break 'recover;
+                // A block holds its records in sequence order: the first lower sequence ends what the block holds.
+                // The records from there on are an older generation of a reused block, or records written out of
+                // order; the scan counts them and restores none.
+                if truncated > 0
+                    || info.addr.sequence < recovered.last().map(|last: &EntryInfo| last.addr.sequence).unwrap_or(0)
+                {
+                    truncated += 1;
+                    continue;
                 }
                 recovered.push(info);
             }
         }
 
-        Ok((recovered, corrupt))
+        Ok((recovered, corrupt, truncated))
     }
 }

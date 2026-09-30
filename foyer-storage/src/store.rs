@@ -171,6 +171,30 @@ where
         self.inner.metrics.storage_enqueue.increase(1);
     }
 
+    /// Push a in-memory cache piece to the disk cache write queue if the queue has room.
+    ///
+    /// Returns `false` when the queue is past its threshold: the piece is then neither queued nor reported as dropped,
+    /// and the caller keeps it, to pace it with [`Store::enqueue_paced`] or to account for it.
+    pub fn try_enqueue(&self, piece: Piece<K, V, P>) -> bool {
+        tracing::trace!(hash = piece.hash(), "[store]: try enqueue piece");
+        let estimated_size = EntrySerializer::estimated_size(piece.key(), piece.value());
+        let taken = if self
+            .filter(
+                piece.hash(),
+                piece.key().estimated_size() + piece.value().estimated_size(),
+            )
+            .is_admitted()
+        {
+            let rpiece = self.inner.keeper.insert(piece);
+            self.inner.engine.try_enqueue(rpiece, estimated_size)
+        } else {
+            self.delete(piece.key());
+            true
+        };
+        self.inner.metrics.storage_enqueue.increase(1);
+        taken
+    }
+
     /// Load a cache entry from the disk cache.
     pub async fn load<Q>(&self, key: &Q) -> Result<Load<K, V, P>>
     where

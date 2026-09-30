@@ -175,6 +175,13 @@ where
         Box::pin(std::future::ready(()))
     }
 
+    /// Push a piece like [`Engine::enqueue`] when the write queue has room. Returns `false`, reporting nothing, when
+    /// the queue is past its threshold: the caller keeps the piece.
+    fn try_enqueue(&self, piece: PieceRef<K, V, P>, estimated_size: usize) -> bool {
+        self.enqueue(piece, estimated_size);
+        true
+    }
+
     /// Load a cache entry from the disk cache.
     ///
     /// `load` may return a false-positive result on entry key hash collision. It's the caller's responsibility to

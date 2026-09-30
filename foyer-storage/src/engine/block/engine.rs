@@ -642,14 +642,29 @@ where
         }
     }
 
-    fn submit(&self, piece: PieceRef<K, V, P>, reservation: Reservation) {
-        let sequence = self.inner.sequence.fetch_add(1, Ordering::Relaxed);
+    /// Pushes a piece when the submit queue has room; returns `false`, reporting nothing, when it is past its threshold.
+    fn try_enqueue(&self, piece: PieceRef<K, V, P>, estimated_size: usize) -> bool {
+        if !self.admits(&piece) {
+            return true;
+        }
+        match self.inner.submit_queue.try_reserve(estimated_size) {
+            Some(reservation) => {
+                self.submit(piece, reservation);
+                true
+            }
+            None => {
+                self.inner.metrics.storage_queue_channel_overflow.increase(1);
+                false
+            }
+        }
+    }
 
-        self.inner.flushers[piece.hash() as usize % self.inner.flushers.len()].submit(Submission::CacheEntry {
+    fn submit(&self, piece: PieceRef<K, V, P>, reservation: Reservation) {
+        self.inner.flushers[piece.hash() as usize % self.inner.flushers.len()].submit_entry(
             piece,
             reservation,
-            sequence,
-        });
+            &self.inner.sequence,
+        );
     }
 
     fn load(&self, hash: u64) -> impl Future<Output = Result<Load<K, V, P>>> + Send + 'static {
@@ -868,6 +883,10 @@ where
 
     fn enqueue_paced(&self, piece: PieceRef<K, V, P>, estimated_size: usize) -> BoxFuture<'static, ()> {
         self.enqueue_paced(piece, estimated_size).boxed()
+    }
+
+    fn try_enqueue(&self, piece: PieceRef<K, V, P>, estimated_size: usize) -> bool {
+        self.try_enqueue(piece, estimated_size)
     }
 
     fn load(&self, hash: u64) -> BoxFuture<'static, Result<Load<K, V, P>>> {
@@ -1946,6 +1965,7 @@ mod tests {
                 restored_entries: 2,
                 restored_payload_bytes: live,
                 discarded_records: 2,
+                truncated_records: 0,
                 corrupt_blocks: 0,
             }]
         );
@@ -1957,5 +1977,117 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(departures, expected);
+    }
+
+    /// A 16 MiB device of 1 MiB blocks with a submit queue no test burst fills: nothing is reclaimed or dropped.
+    async fn engine_for_many_entries(dir: &Path, observer: Arc<Recorder>) -> BlockEngine<u64, Vec<u8>, TestProperties> {
+        let spawner = Spawner::current();
+        let io_engine = io_engine_for_test(spawner.clone()).await;
+        let config = BlockEngineConfig {
+            device: FsDeviceBuilder::new(dir).with_capacity(16 * 1024 * KB).build().unwrap(),
+            block_size: 1024 * KB,
+            compression: Compression::None,
+            indexer_shards: 4,
+            recover_concurrency: 2,
+            flushers: 1,
+            reclaimers: 1,
+            clean_block_threshold: 1,
+            admission_filter: StorageFilter::new(),
+            eviction_pickers: vec![Box::<FifoPicker>::default()],
+            reinsertion_filter: StorageFilter::new().with_condition(RejectAll),
+            enable_tombstone_log: false,
+            entry_observer: Some(observer),
+            buffer_pool_size: 1024 * KB,
+            blob_index_size: 4 * KB,
+            submit_queue_size_threshold: 64 * 1024 * KB,
+            flush_switch: Switch::default(),
+            load_holder: Holder::default(),
+            marker: PhantomData,
+        };
+        let engine = Box::new(config)
+            .build(EngineBuildContext {
+                io_engine,
+                metrics: Arc::new(Metrics::noop()),
+                spawner,
+                recover_mode: RecoverMode::Quiet,
+            })
+            .await
+            .unwrap();
+        (*engine).clone()
+    }
+
+    /// Threads racing to enqueue into one flusher: recovery restores every entry they enqueued and finds none behind
+    /// a lower sequence.
+    #[test_log::test(tokio::test)]
+    async fn test_concurrent_submitters_recover_every_entry() {
+        const SUBMITTERS: u64 = 8;
+        const ENTRIES: u64 = 128;
+        for round in 0..16 {
+            let dir = tempfile::tempdir().unwrap();
+            let memory = cache_for_test();
+            let recorder = Arc::new(Recorder::default());
+            let store = engine_for_many_entries(dir.path(), recorder.clone()).await;
+            std::thread::scope(|scope| {
+                for submitter in 0..SUBMITTERS {
+                    let (store, memory) = (&store, &memory);
+                    scope.spawn(move || {
+                        for key in submitter * ENTRIES..(submitter + 1) * ENTRIES {
+                            let entry = memory.insert(key, vec![key as u8; 64]);
+                            let estimated_size = EntrySerializer::estimated_size(entry.key(), entry.value());
+                            store.enqueue(entry.piece().into(), estimated_size);
+                        }
+                    });
+                }
+            });
+            store.close().await.unwrap();
+            assert!(recorder.dropped.lock().is_empty(), "round {round}");
+            drop(store);
+
+            let recorder = Arc::new(Recorder::default());
+            let store = engine_for_many_entries(dir.path(), recorder.clone()).await;
+            let report = recorder.recoveries.lock()[0];
+            assert_eq!(report.truncated_records, 0, "round {round}");
+            assert_eq!(report.restored_entries, (SUBMITTERS * ENTRIES) as usize, "round {round}");
+            for key in 0..SUBMITTERS * ENTRIES {
+                assert!(
+                    store.inner.indexer.get(memory.hash(&key)).is_some(),
+                    "round {round}: entry {key}"
+                );
+            }
+        }
+    }
+
+    /// Records written behind a lower sequence in one block are counted, not restored.
+    #[test_log::test(tokio::test)]
+    async fn test_recovery_counts_records_behind_a_lower_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = cache_for_test();
+        let store = engine_for_many_entries(dir.path(), Arc::new(Recorder::default())).await;
+        store.hold_flush();
+        for (key, sequence) in [(1u64, 10), (2, 11), (3, 5), (4, 12)] {
+            let entry = memory.insert(key, vec![key as u8; 64]);
+            let estimated_size = EntrySerializer::estimated_size(entry.key(), entry.value());
+            let reservation = store.inner.submit_queue.try_reserve(estimated_size).unwrap();
+            store.inner.flushers[0].submit(Submission::CacheEntry {
+                piece: entry.piece().into(),
+                reservation,
+                sequence,
+            });
+        }
+        store.unhold_flush();
+        store.close().await.unwrap();
+        drop(store);
+
+        let recorder = Arc::new(Recorder::default());
+        let store = engine_for_many_entries(dir.path(), recorder.clone()).await;
+        let report = recorder.recoveries.lock()[0];
+        assert_eq!((report.restored_entries, report.truncated_records), (2, 2));
+        for (key, restored) in [(1, true), (2, true), (3, false), (4, false)] {
+            assert_eq!(
+                store.inner.indexer.get(memory.hash(&key)).is_some(),
+                restored,
+                "entry {key}"
+            );
+        }
     }
 }

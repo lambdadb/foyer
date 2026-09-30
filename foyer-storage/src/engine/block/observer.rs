@@ -70,6 +70,9 @@ pub struct RecoveryReport {
     /// Records found on disk but not restored, each also reported as a
     /// [`DepartureReason::RecoveryDiscard`] departure.
     pub discarded_records: usize,
+    /// Records a block's scan found behind a lower sequence than the record before them and did not restore: the
+    /// older generation of a reused block, or records written out of sequence order.
+    pub truncated_records: usize,
     /// Blocks whose scan stopped at a read error under [`crate::RecoverMode::Quiet`]; their remaining records were
     /// not recovered, so the restore is incomplete. A blob whose index fails its checksum ends the block's scan like
     /// unwritten space and is not counted here.

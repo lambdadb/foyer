@@ -39,6 +39,7 @@ use futures_util::{
     future::{try_join, try_join_all},
 };
 use itertools::Itertools;
+use parking_lot::Mutex;
 
 #[cfg(any(test, feature = "test_utils"))]
 use crate::test_utils::*;
@@ -51,7 +52,7 @@ use crate::{
         observer::WriteDropReason,
         queue::Reservation,
         reclaimer::Reinsertion,
-        serde::Sequence,
+        serde::{AtomicSequence, Sequence},
         tombstone::{Tombstone, TombstoneLog},
     },
     io::{
@@ -124,6 +125,8 @@ where
 {
     id: usize,
     tx: UnboundedSender<Submission<K, V, P>>,
+    /// Held while a cache entry takes its sequence and enters the channel.
+    order: Arc<Mutex<()>>,
 
     metrics: Arc<Metrics>,
 }
@@ -138,6 +141,7 @@ where
         Self {
             id: self.id,
             tx: self.tx.clone(),
+            order: self.order.clone(),
             metrics: self.metrics.clone(),
         }
     }
@@ -151,8 +155,29 @@ where
 {
     pub fn new(id: usize, metrics: Arc<Metrics>) -> (Self, UnboundedReceiver<Submission<K, V, P>>) {
         let (tx, rx) = asyncband::mpsc::unbounded();
-        let this = Self { id, tx, metrics };
+        let this = Self {
+            id,
+            tx,
+            order: Arc::default(),
+            metrics,
+        };
         (this, rx)
+    }
+
+    /// Submits a cache entry with the next sequence of `sequence`.
+    ///
+    /// The flusher writes entries in channel order, and recovery stops a block at the first sequence lower than the
+    /// one before it. Taking the sequence and sending under one lock keeps the channel in sequence order, so
+    /// concurrent submitters cannot interleave between the two steps. The sequence is still taken before the entry
+    /// reaches the flusher, so a delete that takes its tombstone sequence later still supersedes the entry.
+    pub fn submit_entry(&self, piece: PieceRef<K, V, P>, reservation: Reservation, sequence: &AtomicSequence) {
+        let _order = self.order.lock();
+        let sequence = sequence.fetch_add(1, Ordering::Relaxed);
+        self.submit(Submission::CacheEntry {
+            piece,
+            reservation,
+            sequence,
+        });
     }
 
     #[expect(clippy::too_many_arguments)]
