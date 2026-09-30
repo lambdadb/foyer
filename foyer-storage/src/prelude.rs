@@ -22,7 +22,7 @@ pub use crate::{
             engine::BlockEngineConfig,
             eviction::{EvictionInfo, EvictionPicker, FifoPicker, InvalidRatioPicker},
             manager::{Block, BlockStatistics},
-            observer::{Departure, DepartureReason, EntryObserver, RecoveryReport},
+            observer::{Departure, DepartureReason, DroppedWrite, EntryObserver, RecoveryReport, WriteDropReason},
         },
     },
     filter::{

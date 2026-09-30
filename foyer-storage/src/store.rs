@@ -151,6 +151,26 @@ where
             .record(now.elapsed().as_secs_f64());
     }
 
+    /// Push a in-memory cache piece to the disk cache write queue, waiting for room in the queue instead of dropping
+    /// the piece when the queue is full.
+    pub async fn enqueue_paced(&self, piece: Piece<K, V, P>) {
+        tracing::trace!(hash = piece.hash(), "[store]: enqueue piece paced");
+        let estimated_size = EntrySerializer::estimated_size(piece.key(), piece.value());
+        if self
+            .filter(
+                piece.hash(),
+                piece.key().estimated_size() + piece.value().estimated_size(),
+            )
+            .is_admitted()
+        {
+            let rpiece = self.inner.keeper.insert(piece);
+            self.inner.engine.enqueue_paced(rpiece, estimated_size).await;
+        } else {
+            self.delete(piece.key());
+        }
+        self.inner.metrics.storage_enqueue.increase(1);
+    }
+
     /// Load a cache entry from the disk cache.
     pub async fn load<Q>(&self, key: &Q) -> Result<Load<K, V, P>>
     where

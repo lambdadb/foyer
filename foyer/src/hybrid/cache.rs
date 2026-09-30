@@ -540,6 +540,26 @@ where
         entry
     }
 
+    /// Insert cache entry to the hybrid cache like [`HybridCache::insert`]. Under
+    /// [`HybridCachePolicy::WriteOnInsertion`] it returns once the disk cache write queue has taken the entry, so a
+    /// writer faster than the disk waits for it instead of losing disk writes.
+    pub async fn insert_paced(&self, key: K, value: V) -> HybridCacheEntry<K, V, S> {
+        let now = Instant::now();
+
+        let entry = self.inner.memory.insert(key, value);
+        if self.inner.policy == HybridCachePolicy::WriteOnInsertion {
+            self.inner.storage.enqueue_paced(entry.piece()).await;
+        }
+
+        self.inner.metrics.hybrid_insert.increase(1);
+        self.inner
+            .metrics
+            .hybrid_insert_duration
+            .record(now.elapsed().as_secs_f64());
+
+        entry
+    }
+
     /// Insert cache entry to the hybrid cache with properties.
     pub fn insert_with_properties(
         &self,

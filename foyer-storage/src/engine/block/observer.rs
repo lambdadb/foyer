@@ -40,6 +40,26 @@ pub struct Departure {
     pub reason: DepartureReason,
 }
 
+/// Why the block engine dropped a write before it reached the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WriteDropReason {
+    /// An unpaced write found the submit queue past its threshold.
+    QueueFull,
+    /// The entry does not fit an empty flush buffer.
+    Oversized,
+    /// The engine was closing.
+    Closed,
+}
+
+/// A write the block engine dropped before it reached the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DroppedWrite {
+    /// Hash of the entry key.
+    pub hash: u64,
+    /// Why the write was dropped.
+    pub reason: WriteDropReason,
+}
+
 /// Outcome of a successful block engine recovery.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
@@ -66,4 +86,7 @@ pub trait EntryObserver: Send + Sync + Debug + 'static {
 
     /// Called once when recovery finishes successfully.
     fn on_recovery(&self, report: RecoveryReport);
+
+    /// Called once for every write dropped before it reached the disk.
+    fn on_dropped_write(&self, dropped: DroppedWrite);
 }

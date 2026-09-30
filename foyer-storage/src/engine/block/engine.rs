@@ -18,7 +18,7 @@ use std::{
     marker::PhantomData,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Instant,
 };
@@ -56,7 +56,8 @@ use crate::{
         block::{
             eviction::{EvictionPicker, FifoPicker, InvalidRatioPicker},
             manager::{BlockId, BlockManager},
-            observer::{DepartureReason, EntryObserver},
+            observer::{DepartureReason, EntryObserver, WriteDropReason},
+            queue::{Reservation, SubmitQueue},
             reclaimer::{BlockCleaner, Reclaimer, ReclaimerTrait},
             serde::{AtomicSequence, EntryHeader},
             tombstone::{Tombstone, TombstoneLog},
@@ -368,11 +369,11 @@ where
         };
 
         let indexer = Indexer::new(self.indexer_shards, self.entry_observer.clone());
-        let submit_queue_size = Arc::<AtomicUsize>::default();
+        let submit_queue = SubmitQueue::new(self.submit_queue_size_threshold);
 
         #[expect(clippy::type_complexity)]
         let (flushers, rxs): (Vec<Flusher<K, V, P>>, Vec<UnboundedReceiver<Submission<K, V, P>>>) = (0..self.flushers)
-            .map(|id| Flusher::<K, V, P>::new(id, submit_queue_size.clone(), metrics.clone()))
+            .map(|id| Flusher::<K, V, P>::new(id, metrics.clone()))
             .unzip();
 
         let reclaimer = Reclaimer::new(
@@ -449,8 +450,7 @@ where
             indexer,
             block_manager,
             flushers,
-            submit_queue_size,
-            submit_queue_size_threshold: self.submit_queue_size_threshold,
+            submit_queue,
             sequence,
             _spawner: runtime,
             active: AtomicBool::new(true),
@@ -525,8 +525,7 @@ where
 
     flushers: Vec<Flusher<K, V, P>>,
 
-    submit_queue_size: Arc<AtomicUsize>,
-    submit_queue_size_threshold: usize,
+    submit_queue: Arc<SubmitQueue>,
 
     sequence: AtomicSequence,
 
@@ -575,6 +574,7 @@ where
         let this = self.clone();
         async move {
             this.inner.active.store(false, Ordering::Relaxed);
+            this.inner.submit_queue.close();
             this.wait().await;
             Ok(())
         }
@@ -583,9 +583,48 @@ where
 
     #[cfg_attr(feature = "tracing", trace(name = "foyer::storage::engine::block::engine::enqueue"))]
     fn enqueue(&self, piece: PieceRef<K, V, P>, estimated_size: usize) {
+        if !self.admits(&piece) {
+            return;
+        }
+        match self.inner.submit_queue.try_reserve(estimated_size) {
+            Some(reservation) => self.submit(piece, reservation),
+            None => {
+                self.inner.metrics.storage_queue_channel_overflow.increase(1);
+                self.inner
+                    .indexer
+                    .report_dropped_write(piece.hash(), WriteDropReason::QueueFull);
+            }
+        }
+    }
+
+    fn enqueue_paced(
+        &self,
+        piece: PieceRef<K, V, P>,
+        estimated_size: usize,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let this = self.clone();
+        async move {
+            if !this.admits(&piece) {
+                return;
+            }
+            match this.inner.submit_queue.reserve_paced(estimated_size).await {
+                Some(reservation) => this.submit(piece, reservation),
+                None => this
+                    .inner
+                    .indexer
+                    .report_dropped_write(piece.hash(), WriteDropReason::Closed),
+            }
+        }
+    }
+
+    /// Whether a piece may be written: the engine is open and the piece is not young.
+    fn admits(&self, piece: &PieceRef<K, V, P>) -> bool {
         if !self.inner.active.load(Ordering::Relaxed) {
             tracing::warn!("cannot enqueue new entry after closed");
-            return;
+            self.inner
+                .indexer
+                .report_dropped_write(piece.hash(), WriteDropReason::Closed);
+            return false;
         }
 
         tracing::trace!(
@@ -594,24 +633,21 @@ where
             "[block engine]: enqueue"
         );
         match piece.properties().age().unwrap_or_default() {
-            Age::Fresh | Age::Old => {}
+            Age::Fresh | Age::Old => true,
             Age::Young => {
                 // skip write block engine if the entry is still young
                 self.inner.metrics.storage_block_engine_enqueue_skip.increase(1);
-                return;
+                false
             }
         }
+    }
 
-        if self.inner.submit_queue_size.load(Ordering::Relaxed) > self.inner.submit_queue_size_threshold {
-            self.inner.metrics.storage_queue_channel_overflow.increase(1);
-            return;
-        }
-
+    fn submit(&self, piece: PieceRef<K, V, P>, reservation: Reservation) {
         let sequence = self.inner.sequence.fetch_add(1, Ordering::Relaxed);
 
         self.inner.flushers[piece.hash() as usize % self.inner.flushers.len()].submit(Submission::CacheEntry {
             piece,
-            estimated_size,
+            reservation,
             sequence,
         });
     }
@@ -830,6 +866,10 @@ where
         self.enqueue(piece, estimated_size);
     }
 
+    fn enqueue_paced(&self, piece: PieceRef<K, V, P>, estimated_size: usize) -> BoxFuture<'static, ()> {
+        self.enqueue_paced(piece, estimated_size).boxed()
+    }
+
     fn load(&self, hash: u64) -> BoxFuture<'static, Result<Load<K, V, P>>> {
         // TODO(MrCroxx): refactor this.
         self.load(hash).boxed()
@@ -880,7 +920,7 @@ mod tests {
         PsyncIoEngineConfig, RejectAll,
         engine::{
             RecoverMode,
-            block::observer::{Departure, RecoveryReport},
+            block::observer::{Departure, DroppedWrite, RecoveryReport},
         },
         io::{
             device::{DeviceBuilder, combined::CombinedDeviceBuilder, file::FileDeviceBuilder, fs::FsDeviceBuilder},
@@ -1434,6 +1474,7 @@ mod tests {
     struct Recorder {
         departures: parking_lot::Mutex<Vec<Departure>>,
         recoveries: parking_lot::Mutex<Vec<RecoveryReport>>,
+        dropped: parking_lot::Mutex<Vec<DroppedWrite>>,
     }
 
     impl EntryObserver for Recorder {
@@ -1443,6 +1484,10 @@ mod tests {
 
         fn on_recovery(&self, report: RecoveryReport) {
             self.recoveries.lock().push(report);
+        }
+
+        fn on_dropped_write(&self, dropped: DroppedWrite) {
+            self.dropped.lock().push(dropped);
         }
     }
 
@@ -1508,6 +1553,121 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    /// Holds one flush buffer of a 16 KiB block and a 16 KiB submit queue: a few 3 KiB entries fill either.
+    async fn engine_with_small_write_path(
+        dir: &Path,
+        observer: Arc<Recorder>,
+    ) -> BlockEngine<u64, Vec<u8>, TestProperties> {
+        let spawner = Spawner::current();
+        let io_engine = io_engine_for_test(spawner.clone()).await;
+        let config = BlockEngineConfig {
+            device: FsDeviceBuilder::new(dir).with_capacity(256 * KB).build().unwrap(),
+            block_size: 16 * KB,
+            compression: Compression::None,
+            indexer_shards: 4,
+            recover_concurrency: 2,
+            flushers: 1,
+            reclaimers: 1,
+            clean_block_threshold: 1,
+            admission_filter: StorageFilter::new(),
+            eviction_pickers: vec![Box::<FifoPicker>::default()],
+            reinsertion_filter: StorageFilter::new().with_condition(RejectAll),
+            enable_tombstone_log: false,
+            entry_observer: Some(observer),
+            buffer_pool_size: 16 * KB,
+            blob_index_size: 4 * KB,
+            submit_queue_size_threshold: 16 * KB,
+            flush_switch: Switch::default(),
+            load_holder: Holder::default(),
+            marker: PhantomData,
+        };
+        let engine = Box::new(config)
+            .build(EngineBuildContext {
+                io_engine,
+                metrics: Arc::new(Metrics::noop()),
+                spawner,
+                recover_mode: RecoverMode::None,
+            })
+            .await
+            .unwrap();
+        (*engine).clone()
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_paced_writes_wait_for_the_flusher_and_unpaced_overflow_is_reported() {
+        const ENTRIES: u64 = 12;
+        let bound = std::time::Duration::from_secs(10);
+        let dir = tempfile::tempdir().unwrap();
+        let memory = cache_for_test();
+        let recorder = Arc::new(Recorder::default());
+        let store = engine_with_small_write_path(dir.path(), recorder.clone()).await;
+        let piece = |key: u64| {
+            let entry = memory.insert(key, vec![key as u8; 3 * KB]);
+            let estimated_size = EntrySerializer::estimated_size(entry.key(), entry.value());
+            (PieceRef::from(entry.piece()), estimated_size)
+        };
+
+        // Paced: with the flush held, the writer outruns the one buffer and waits; released, every entry lands.
+        store.hold_flush();
+        let pieces = (0..ENTRIES).map(piece).collect_vec();
+        let writer = tokio::spawn({
+            let store = store.clone();
+            async move {
+                for (piece, estimated_size) in pieces {
+                    store.enqueue_paced(piece, estimated_size).await;
+                }
+            }
+        });
+        store.unhold_flush();
+        let flushed = store.wait();
+        tokio::time::timeout(bound, writer).await.unwrap().unwrap();
+        tokio::time::timeout(bound, flushed).await.unwrap();
+        tokio::time::timeout(bound, store.wait()).await.unwrap();
+        for key in 0..ENTRIES {
+            assert!(
+                store.inner.indexer.get(memory.hash(&key)).is_some(),
+                "entry {key} written"
+            );
+        }
+        assert!(recorder.dropped.lock().is_empty());
+
+        // Unpaced: past the submit queue threshold the write is dropped and reported.
+        store.hold_flush();
+        for key in ENTRIES..2 * ENTRIES {
+            let (piece, estimated_size) = piece(key);
+            store.enqueue(piece, estimated_size);
+        }
+        store.unhold_flush();
+        tokio::time::timeout(bound, store.wait()).await.unwrap();
+        let dropped = std::mem::take(&mut *recorder.dropped.lock());
+        assert!(!dropped.is_empty());
+        assert!(
+            dropped
+                .iter()
+                .all(|dropped| dropped.reason == WriteDropReason::QueueFull)
+        );
+        let written = (ENTRIES..2 * ENTRIES)
+            .filter(|key| store.inner.indexer.get(memory.hash(key)).is_some())
+            .count();
+        assert_eq!(written + dropped.len(), ENTRIES as usize);
+
+        // An entry larger than the flush buffer is dropped as oversized; after close, writes are dropped as closed.
+        let entry = memory.insert(u64::MAX, vec![0; 17 * KB]);
+        let estimated_size = EntrySerializer::estimated_size(entry.key(), entry.value());
+        store.enqueue_paced(entry.piece().into(), estimated_size).await;
+        tokio::time::timeout(bound, store.wait()).await.unwrap();
+        store.close().await.unwrap();
+        let (piece, estimated_size) = piece(0);
+        store.enqueue_paced(piece, estimated_size).await;
+        let reasons = recorder
+            .dropped
+            .lock()
+            .iter()
+            .map(|dropped| dropped.reason)
+            .collect_vec();
+        assert_eq!(reasons, vec![WriteDropReason::Oversized, WriteDropReason::Closed]);
     }
 
     fn assert_payload_matches_index(store: &BlockEngine<u64, Vec<u8>, TestProperties>) {
@@ -1609,21 +1769,38 @@ mod tests {
             .sum()
     }
 
+    /// Deallocates every file under `dir` while keeping its length.
+    #[cfg(target_family = "unix")]
+    fn deallocate(dir: &Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                let len = file.metadata().unwrap().len();
+                file.set_len(0).unwrap();
+                file.set_len(len).unwrap();
+                file.sync_all().unwrap();
+            }
+        }
+    }
+
     #[cfg(target_family = "unix")]
     #[test_log::test(tokio::test)]
-    async fn test_allocated_bytes_follow_filesystem_across_restart() {
-        allocated_bytes_follow_filesystem_across_restart(false).await;
+    async fn test_allocated_bytes_count_writes_and_read_filesystem_at_open() {
+        allocated_bytes_count_writes_and_read_filesystem_at_open(false).await;
     }
 
     /// Partitions of one file are ranges of it, so each block reads its own extent.
     #[cfg(target_family = "unix")]
     #[test_log::test(tokio::test)]
-    async fn test_allocated_bytes_follow_filesystem_across_restart_on_one_file() {
-        allocated_bytes_follow_filesystem_across_restart(true).await;
+    async fn test_allocated_bytes_count_writes_and_read_filesystem_at_open_on_one_file() {
+        allocated_bytes_count_writes_and_read_filesystem_at_open(true).await;
     }
 
+    /// The running count comes from the engine's own writes, so reading it does no filesystem IO; the filesystem's
+    /// allocation is read once, when the engine opens.
     #[cfg(target_family = "unix")]
-    async fn allocated_bytes_follow_filesystem_across_restart(one_file: bool) {
+    async fn allocated_bytes_count_writes_and_read_filesystem_at_open(one_file: bool) {
         let dir = tempfile::tempdir().unwrap();
         let memory = cache_for_test();
         let open = || async {
@@ -1652,18 +1829,32 @@ mod tests {
         store.wait().await;
         let allocated = store.allocated_bytes();
         assert!(allocated >= store.entry_payload_bytes() + 2 * EntryHeader::serialized_len());
-        assert_eq!(allocated, filesystem_allocated(dir.path()));
+        // A filesystem may allocate more than was written (APFS materializes a sparse file on its first write).
+        assert!(allocated <= filesystem_allocated(dir.path()));
 
         // Replacing an entry leaves the obsolete record allocated.
         enqueue(&store, memory.insert(1, vec![!1; 2 * KB]));
         store.wait().await;
-        let allocated = store.allocated_bytes();
-        assert_eq!(allocated, filesystem_allocated(dir.path()));
+        let replaced = store.allocated_bytes();
+        assert!(replaced > allocated);
+        assert!(replaced <= filesystem_allocated(dir.path()));
         store.close().await.unwrap();
         drop(store);
 
         let store = open().await;
-        assert_eq!(store.allocated_bytes(), allocated);
+        let reopened = store.allocated_bytes();
+        assert_eq!(reopened, filesystem_allocated(dir.path()));
+        assert!(reopened >= replaced);
+
+        // Reading the count does not look at the filesystem again.
+        deallocate(dir.path());
+        assert_eq!(filesystem_allocated(dir.path()), 0);
+        assert_eq!(store.allocated_bytes(), reopened);
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = open().await;
+        assert_eq!(store.allocated_bytes(), 0);
     }
 
     #[test_log::test(tokio::test)]

@@ -168,6 +168,13 @@ where
     /// Push a in-memory cache piece to the disk cache write queue.
     fn enqueue(&self, piece: PieceRef<K, V, P>, estimated_size: usize);
 
+    /// Push a piece like [`Engine::enqueue`], but wait for room in the write queue instead of dropping the piece when
+    /// the queue is full.
+    fn enqueue_paced(&self, piece: PieceRef<K, V, P>, estimated_size: usize) -> BoxFuture<'static, ()> {
+        self.enqueue(piece, estimated_size);
+        Box::pin(std::future::ready(()))
+    }
+
     /// Load a cache entry from the disk cache.
     ///
     /// `load` may return a false-positive result on entry key hash collision. It's the caller's responsibility to

@@ -25,7 +25,7 @@ use parking_lot::RwLock;
 
 use crate::engine::block::{
     manager::BlockId,
-    observer::{Departure, DepartureReason, EntryObserver},
+    observer::{Departure, DepartureReason, DroppedWrite, EntryObserver, WriteDropReason},
     serde::{EntryHeader, Sequence},
 };
 
@@ -87,6 +87,12 @@ impl Indexer {
             shards: Arc::new(shards),
             payload: Arc::default(),
             observer,
+        }
+    }
+
+    pub fn report_dropped_write(&self, hash: u64, reason: WriteDropReason) {
+        if let Some(observer) = &self.observer {
+            observer.on_dropped_write(DroppedWrite { hash, reason });
         }
     }
 
@@ -354,6 +360,8 @@ mod tests {
         }
 
         fn on_recovery(&self, _: RecoveryReport) {}
+
+        fn on_dropped_write(&self, _: DroppedWrite) {}
     }
 
     impl Recorder {

@@ -16,10 +16,7 @@ use std::{
     collections::VecDeque,
     fmt::Debug,
     future::{Future, poll_fn},
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     task::{Poll, ready},
     time::Instant,
 };
@@ -51,6 +48,8 @@ use crate::{
         buffer::{Batch, BlobPart, Block, Buffer, SplitCtx, Splitter},
         indexer::{EntryAddress, HashedEntryAddress, Indexer},
         manager::{BlockId, BlockManager, GetCleanBlockHandle},
+        observer::WriteDropReason,
+        queue::Reservation,
         reclaimer::Reinsertion,
         serde::Sequence,
         tombstone::{Tombstone, TombstoneLog},
@@ -70,7 +69,7 @@ where
 {
     CacheEntry {
         piece: PieceRef<K, V, P>,
-        estimated_size: usize,
+        reservation: Reservation,
         sequence: Sequence,
     },
     Tombstone {
@@ -95,12 +94,12 @@ where
         match self {
             Self::CacheEntry {
                 piece,
-                estimated_size,
+                reservation,
                 sequence,
             } => f
                 .debug_struct("CacheEntry")
                 .field("piece", piece)
-                .field("estimated_size", estimated_size)
+                .field("reservation", reservation)
                 .field("sequence", sequence)
                 .finish(),
             Self::Tombstone { tombstone, stats } => f
@@ -125,7 +124,6 @@ where
 {
     id: usize,
     tx: UnboundedSender<Submission<K, V, P>>,
-    submit_queue_size: Arc<AtomicUsize>,
 
     metrics: Arc<Metrics>,
 }
@@ -140,7 +138,6 @@ where
         Self {
             id: self.id,
             tx: self.tx.clone(),
-            submit_queue_size: self.submit_queue_size.clone(),
             metrics: self.metrics.clone(),
         }
     }
@@ -152,18 +149,9 @@ where
     V: StorageValue,
     P: Properties,
 {
-    pub fn new(
-        id: usize,
-        submit_queue_size: Arc<AtomicUsize>,
-        metrics: Arc<Metrics>,
-    ) -> (Self, UnboundedReceiver<Submission<K, V, P>>) {
+    pub fn new(id: usize, metrics: Arc<Metrics>) -> (Self, UnboundedReceiver<Submission<K, V, P>>) {
         let (tx, rx) = asyncband::mpsc::unbounded();
-        let this = Self {
-            id,
-            tx,
-            submit_queue_size,
-            metrics,
-        };
+        let this = Self { id, tx, metrics };
         (this, rx)
     }
 
@@ -211,7 +199,7 @@ where
             piece_refs: vec![],
             rotate_buffer,
             queue_init: None,
-            submit_queue_size: self.submit_queue_size.clone(),
+            pending: VecDeque::new(),
             block_manager,
             indexer,
             tombstone_log,
@@ -236,9 +224,6 @@ where
 
     pub fn submit(&self, submission: Submission<K, V, P>) {
         tracing::trace!(id = self.id, "[block engine flusher]: submit task: {submission:?}");
-        if let Submission::CacheEntry { estimated_size, .. } = &submission {
-            self.submit_queue_size.fetch_add(*estimated_size, Ordering::Relaxed);
-        }
         if let Err(e) = self.tx.send(submission) {
             tracing::error!(
                 id = self.id,
@@ -305,7 +290,9 @@ where
     /// Use this field to avoid allocation.
     rotate_buffer: Option<IoSliceMut>,
 
-    submit_queue_size: Arc<AtomicUsize>,
+    /// Submissions behind one that did not fit the filling buffer, applied in order once it rotates. Their entries
+    /// keep their submit queue reservations, so paced writers wait instead of the flusher dropping entries.
+    pending: VecDeque<Submission<K, V, P>>,
 
     current_block_handle: GetCleanBlockHandle,
 
@@ -384,6 +371,7 @@ where
                 let io_buffer = self.rotate_buffer.take().unwrap();
                 let buffer = Buffer::new(io_buffer, self.max_entry_size, self.metrics.clone());
                 self.buffer = Some(buffer);
+                self.apply_pending();
             }
 
             tokio::select! {
@@ -413,49 +401,71 @@ where
             "[block engine flush runner]: recv submission"
         );
 
+        if !self.pending.is_empty() {
+            self.pending.push_back(submission);
+            return;
+        }
+        if let Err(submission) = self.apply(submission) {
+            self.pending.push_back(submission);
+        }
+    }
+
+    /// Applies the pending submissions in order until one does not fit the new buffer.
+    fn apply_pending(&mut self) {
+        while let Some(submission) = self.pending.pop_front() {
+            if let Err(submission) = self.apply(submission) {
+                self.pending.push_front(submission);
+                return;
+            }
+        }
+    }
+
+    /// Takes the submission into the filling buffer, or hands it back when it must wait for the buffer to rotate. An
+    /// entry that does not fit even an empty buffer is dropped.
+    fn apply(&mut self, submission: Submission<K, V, P>) -> std::result::Result<(), Submission<K, V, P>> {
         if self.queue_init.is_none() {
             self.queue_init = Some(Instant::now());
         }
-
-        let report = |written: bool| {
-            if !written {
-                self.metrics.storage_queue_buffer_overflow.increase(1);
-            }
-        };
-
+        let buffer = self.buffer.as_mut().unwrap();
         match submission {
             Submission::CacheEntry {
                 piece,
-                estimated_size,
+                reservation,
                 sequence,
             } => {
-                let enqueued = self.buffer.as_mut().unwrap().push(
-                    piece.key(),
-                    piece.value(),
-                    piece.hash(),
-                    self.compression,
-                    sequence,
-                );
-                if enqueued {
+                if buffer.push(piece.key(), piece.value(), piece.hash(), self.compression, sequence) {
                     self.piece_refs.push(piece);
+                } else if buffer.is_empty() {
+                    self.metrics.storage_queue_buffer_overflow.increase(1);
+                    self.indexer
+                        .report_dropped_write(piece.hash(), WriteDropReason::Oversized);
+                } else {
+                    return Err(Submission::CacheEntry {
+                        piece,
+                        reservation,
+                        sequence,
+                    });
                 }
-                report(enqueued);
-                self.submit_queue_size.fetch_sub(estimated_size, Ordering::Relaxed);
             }
-
             Submission::Tombstone { tombstone, stats } => self.tombstone_infos.push(TombstoneInfo { tombstone, stats }),
             Submission::Reinsertion { reinsertion } => {
                 // Skip reinsertion if the entry is not in the indexer.
-                if self.indexer.get(reinsertion.hash).is_some() {
-                    report(self.buffer.as_mut().unwrap().push_slice(
+                if self.indexer.get(reinsertion.hash).is_some()
+                    && !buffer.push_slice(
                         &reinsertion.slice[..reinsertion.len],
                         reinsertion.hash,
                         reinsertion.sequence,
-                    ));
+                    )
+                {
+                    if !buffer.is_empty() {
+                        return Err(Submission::Reinsertion { reinsertion });
+                    }
+                    self.metrics.storage_queue_buffer_overflow.increase(1);
                 }
             }
             Submission::Wait { tx } => self.waiters.push(tx),
         }
+        Ok(())
     }
 
     fn submit_io_task(
