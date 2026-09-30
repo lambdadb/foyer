@@ -100,8 +100,6 @@ impl DeviceBuilder for FileDeviceBuilder {
         });
         let capacity = align_v(capacity, PAGE);
 
-        println!("==========> {capacity}");
-
         // Build device.
 
         let mut opts = OpenOptions::new();

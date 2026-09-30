@@ -883,7 +883,7 @@ mod tests {
             block::observer::{Departure, RecoveryReport},
         },
         io::{
-            device::{DeviceBuilder, combined::CombinedDeviceBuilder, fs::FsDeviceBuilder},
+            device::{DeviceBuilder, combined::CombinedDeviceBuilder, file::FileDeviceBuilder, fs::FsDeviceBuilder},
             engine::{IoEngine, IoEngineBuildContext, IoEngineConfig},
         },
         serde::EntrySerializer,
@@ -1467,6 +1467,15 @@ mod tests {
             .with_capacity(64 * KB + tombstone)
             .build()
             .unwrap();
+        engine_on_device(device, observer, enable_tombstone_log, reinsertion_filter).await
+    }
+
+    async fn engine_on_device(
+        device: Arc<dyn Device>,
+        observer: Arc<Recorder>,
+        enable_tombstone_log: bool,
+        reinsertion_filter: StorageFilter,
+    ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
         let spawner = Spawner::current();
         let io_engine = io_engine_for_test(spawner.clone()).await;
         let builder = BlockEngineConfig {
@@ -1603,15 +1612,36 @@ mod tests {
     #[cfg(target_family = "unix")]
     #[test_log::test(tokio::test)]
     async fn test_allocated_bytes_follow_filesystem_across_restart() {
+        allocated_bytes_follow_filesystem_across_restart(false).await;
+    }
+
+    /// Partitions of one file are ranges of it, so each block reads its own extent.
+    #[cfg(target_family = "unix")]
+    #[test_log::test(tokio::test)]
+    async fn test_allocated_bytes_follow_filesystem_across_restart_on_one_file() {
+        allocated_bytes_follow_filesystem_across_restart(true).await;
+    }
+
+    #[cfg(target_family = "unix")]
+    async fn allocated_bytes_follow_filesystem_across_restart(one_file: bool) {
         let dir = tempfile::tempdir().unwrap();
         let memory = cache_for_test();
-        let open = || {
-            engine_with_observer(
-                dir.path(),
+        let open = || async {
+            let device = if one_file {
+                FileDeviceBuilder::new(dir.path().join("blocks"))
+                    .with_capacity(64 * KB)
+                    .build()
+                    .unwrap()
+            } else {
+                FsDeviceBuilder::new(dir.path()).with_capacity(64 * KB).build().unwrap()
+            };
+            engine_on_device(
+                device,
                 Arc::new(Recorder::default()),
                 false,
                 StorageFilter::new().with_condition(RejectAll),
             )
+            .await
         };
         let store = open().await;
         assert_eq!(store.allocated_bytes(), 0);
