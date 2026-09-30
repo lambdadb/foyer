@@ -773,6 +773,23 @@ where
         }
     }
 
+    /// Get cached entry with the given key without updating its eviction information.
+    ///
+    /// Unlike [`Cache::get`], the entry keeps its place in the eviction order.
+    #[cfg_attr(feature = "tracing", fastrace::trace(name = "foyer::memory::cache::peek"))]
+    pub fn peek<Q>(&self, key: &Q) -> Option<CacheEntry<K, V, S, P>>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        match self {
+            Cache::Fifo(cache) => cache.peek(key).map(CacheEntry::from),
+            Cache::S3Fifo(cache) => cache.peek(key).map(CacheEntry::from),
+            Cache::Lru(cache) => cache.peek(key).map(CacheEntry::from),
+            Cache::Lfu(cache) => cache.peek(key).map(CacheEntry::from),
+            Cache::Sieve(cache) => cache.peek(key).map(CacheEntry::from),
+        }
+    }
+
     /// Check if the in-memory cache contains a cached entry with the given key.
     #[cfg_attr(feature = "tracing", fastrace::trace(name = "foyer::memory::cache::contains"))]
     pub fn contains<Q>(&self, key: &Q) -> bool
@@ -1175,6 +1192,29 @@ mod tests {
 
     use super::*;
     use crate::eviction::{fifo::FifoConfig, lfu::LfuConfig, lru::LruConfig, s3fifo::S3FifoConfig};
+
+    #[test]
+    fn test_peek_keeps_eviction_order() {
+        let lru = |touch: fn(&Cache<u64, u64>)| {
+            let cache: Cache<u64, u64> = CacheBuilder::new(2)
+                .with_shards(1)
+                .with_eviction_config(LruConfig {
+                    high_priority_pool_ratio: 0.0,
+                })
+                .build();
+            cache.insert(1, 1);
+            cache.insert(2, 2);
+            touch(&cache);
+            cache.insert(3, 3);
+            (cache.contains(&1), cache.contains(&2))
+        };
+        // A peek returns the entry but leaves it the least recently used.
+        assert_eq!(
+            lru(|cache| assert_eq!(*cache.peek(&1).unwrap().value(), 1)),
+            (false, true)
+        );
+        assert_eq!(lru(|cache| drop(cache.get(&1))), (true, false));
+    }
 
     const CAPACITY: usize = 100;
     const SHARDS: usize = 4;

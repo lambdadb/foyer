@@ -776,6 +776,23 @@ where
         })
     }
 
+    #[cfg_attr(feature = "tracing", fastrace::trace(name = "foyer::memory::raw::peek"))]
+    pub fn peek<Q>(&self, key: &Q) -> Option<RawCacheEntry<E, S, I>>
+    where
+        Q: Hash + Equivalent<E::Key> + ?Sized,
+    {
+        let hash = self.inner.hash_builder.hash_one(key);
+
+        let record = self.inner.shards[self.shard(hash)].read().get_noop(hash, key)?;
+
+        Some(RawCacheEntry {
+            pipe: self.pipe.clone(),
+            inner: self.inner.clone(),
+            record,
+            source: Source::Memory,
+        })
+    }
+
     #[cfg_attr(feature = "tracing", fastrace::trace(name = "foyer::memory::raw::contains"))]
     pub fn contains<Q>(&self, key: &Q) -> bool
     where
