@@ -77,36 +77,24 @@ struct BlockInner {
     partition: Arc<dyn Partition>,
     io_engine: Arc<dyn IoEngine>,
     statistics: Arc<BlockStatistics>,
-    /// End of the furthest write into the partition.
-    written: AtomicUsize,
-    /// Sum of `written` over the blocks of one engine.
-    allocated: Arc<AtomicUsize>,
 }
 
 impl BlockInner {
-    fn new(
-        id: BlockId,
-        partition: Arc<dyn Partition>,
-        io_engine: Arc<dyn IoEngine>,
-        allocated: Arc<AtomicUsize>,
-    ) -> Self {
-        let written = written_extent(partition.as_ref());
-        allocated.fetch_add(written, Ordering::Relaxed);
+    fn new(id: BlockId, partition: Arc<dyn Partition>, io_engine: Arc<dyn IoEngine>) -> Self {
         Self {
             id,
             partition,
             io_engine,
             statistics: Arc::<BlockStatistics>::default(),
-            written: AtomicUsize::new(written),
-            allocated,
         }
     }
 }
 
 /// End of the last data extent the filesystem holds for the partition.
 ///
-/// Blocks are written sequentially from their start and never deallocated, so this is the allocation a previous
-/// process left behind.
+/// Blocks are written sequentially from their start and never deallocated, so this is what the partition occupies.
+/// It is read from the filesystem rather than from the writes: a filesystem that materializes a sparse file on its
+/// first write (APFS) allocates more than was written.
 #[cfg(target_family = "unix")]
 fn written_extent(partition: &dyn Partition) -> usize {
     let (file, base) = partition.translate(0);
@@ -160,19 +148,10 @@ impl Block {
     }
 
     pub(crate) async fn write(&self, buf: Box<dyn IoBuf>, offset: u64) -> (Box<dyn IoB>, Result<()>) {
-        let end = offset as usize + buf.len();
-        let (buf, res) = self
-            .inner
+        self.inner
             .io_engine
             .write(buf, self.inner.partition.as_ref(), offset)
-            .await;
-        if res.is_ok() {
-            let previous = self.inner.written.fetch_max(end, Ordering::Relaxed);
-            if end > previous {
-                self.inner.allocated.fetch_add(end - previous, Ordering::Relaxed);
-            }
-        }
-        (buf, res)
+            .await
     }
 
     pub(crate) async fn read(&self, buf: Box<dyn IoBufMut>, offset: u64) -> (Box<dyn IoB>, Result<()>) {
@@ -192,7 +171,7 @@ impl Block {
 #[cfg(test)]
 impl Block {
     pub(crate) fn new_for_test(id: BlockId, partition: Arc<dyn Partition>, io_engine: Arc<dyn IoEngine>) -> Self {
-        let inner = Arc::new(BlockInner::new(id, partition, io_engine, Arc::default()));
+        let inner = Arc::new(BlockInner::new(id, partition, io_engine));
         Self { inner }
     }
 }
@@ -222,7 +201,6 @@ struct Inner {
     clean_block_threshold: usize,
     metrics: Arc<Metrics>,
     spawner: Spawner,
-    allocated: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone)]
@@ -244,7 +222,6 @@ impl BlockManager {
         spawner: Spawner,
     ) -> Result<Self> {
         let mut blocks = vec![];
-        let allocated = Arc::<AtomicUsize>::default();
 
         while device.free() >= block_size {
             let partition = match device.create_partition(block_size) {
@@ -254,7 +231,7 @@ impl BlockManager {
             };
             let id = blocks.len() as BlockId;
             let block = Block {
-                inner: Arc::new(BlockInner::new(id, partition, io_engine.clone(), allocated.clone())),
+                inner: Arc::new(BlockInner::new(id, partition, io_engine.clone())),
             };
             blocks.push(block);
         }
@@ -283,16 +260,20 @@ impl BlockManager {
             clean_block_threshold,
             metrics,
             spawner,
-            allocated,
         };
         let inner = Arc::new(inner);
         let this = Self { inner };
         Ok(this)
     }
 
-    /// Filesystem allocation of all blocks: the written extent of each, including padding and obsolete records.
+    /// Filesystem allocation of all blocks, read from the filesystem: the written extent of each, including padding
+    /// and obsolete records.
     pub fn allocated_bytes(&self) -> usize {
-        self.inner.allocated.load(Ordering::Relaxed)
+        self.inner
+            .blocks
+            .iter()
+            .map(|block| written_extent(block.inner.partition.as_ref()))
+            .sum()
     }
 
     pub fn init(&self, clean_blocks: &[BlockId]) {
