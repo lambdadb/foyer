@@ -279,9 +279,9 @@ where
         }
     }
 
-    /// Load the first page and the page runs `pages` of a cache entry from the disk cache, without the value
-    /// checksum: see [`Engine::load_range`]. An entry still in the write queue is returned whole.
-    pub async fn load_pages<Q>(&self, key: &Q, pages: Vec<Range<u32>>) -> Result<PageLoad<K, V, P>>
+    /// Load the page runs `pages` of a cache entry from the disk cache, and its first page `with_head`, without the
+    /// value checksum: see [`Engine::load_range`]. An entry still in the write queue is returned whole.
+    pub async fn load_pages<Q>(&self, key: &Q, pages: Vec<Range<u32>>, with_head: bool) -> Result<PageLoad<K, V, P>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
@@ -293,7 +293,7 @@ where
             return Ok(PageLoad::Piece(piece));
         }
 
-        let load = self.inner.engine.load_range(hash, pages).await;
+        let load = self.inner.engine.load_range(hash, pages, with_head).await;
         match &load {
             Ok(PageLoad::Pages(_)) | Ok(PageLoad::Piece(_)) => self.inner.metrics.storage_hit.increase(1),
             Ok(PageLoad::Miss) => self.inner.metrics.storage_miss.increase(1),

@@ -793,8 +793,9 @@ where
         &self,
         hash: u64,
         pages: Vec<Range<u32>>,
+        with_head: bool,
     ) -> impl Future<Output = Result<PageLoad<K, V, P>>> + Send + 'static {
-        tracing::trace!(hash, ?pages, "[block engine]: load range");
+        tracing::trace!(hash, ?pages, with_head, "[block engine]: load range");
 
         let indexer = self.inner.indexer.clone();
         let block_manager = self.inner.block_manager.clone();
@@ -823,8 +824,9 @@ where
                 return Ok(PageLoad::Throttled);
             }
 
-            // The header page is read on its own unless the first run starts with it.
-            let head_apart = pages.first().is_none_or(|run| run.start != 0);
+            // The header page is read on its own unless the first run starts with it, or not at all when the caller
+            // verifies the pages it asked for against what it holds of the entry.
+            let head_apart = with_head && pages.first().is_none_or(|run| run.start != 0);
             let reads = head_apart.then_some(0..1).into_iter().chain(pages.iter().cloned());
             let mut bufs = try_join_all(reads.map(|run| {
                 let block = block.clone();
@@ -837,6 +839,14 @@ where
             }))
             .await
             .inspect_err(|e| tracing::error!(hash, ?addr, ?e, "[block engine load range]: load error"))?;
+            if !with_head {
+                return Ok(PageLoad::Pages(EntryPages {
+                    head: Bytes::new(),
+                    runs: bufs,
+                    key_len: 0,
+                    value_len: 0,
+                }));
+            }
             let head = match head_apart {
                 true => bufs.remove(0),
                 false => bufs[0].slice(..PAGE),
@@ -1003,8 +1013,13 @@ where
         self.load(hash).boxed()
     }
 
-    fn load_range(&self, hash: u64, pages: Vec<Range<u32>>) -> BoxFuture<'static, Result<PageLoad<K, V, P>>> {
-        self.load_range(hash, pages).boxed()
+    fn load_range(
+        &self,
+        hash: u64,
+        pages: Vec<Range<u32>>,
+        with_head: bool,
+    ) -> BoxFuture<'static, Result<PageLoad<K, V, P>>> {
+        self.load_range(hash, pages, with_head).boxed()
     }
 
     fn delete(&self, hash: u64) {
@@ -1609,7 +1624,7 @@ mod tests {
         ];
         for (runs, pages_read) in cases {
             let before = statistics.disk_read_bytes();
-            let load = store.load_range(hash, runs.clone()).await.unwrap();
+            let load = store.load_range(hash, runs.clone(), true).await.unwrap();
             let PageLoad::Pages(pages) = load else {
                 panic!("entry pages expected for {runs:?}: {load:?}");
             };
@@ -1625,12 +1640,28 @@ mod tests {
             }
         }
 
-        let past = store.load_range(hash, vec![2..4]).await.unwrap_err();
+        // Without the header page: only the runs are read, and the head and lengths are empty.
+        for runs in [vec![2..3], vec![0..1, 2..3]] {
+            let before = statistics.disk_read_bytes();
+            let load = store.load_range(hash, runs.clone(), false).await.unwrap();
+            let PageLoad::Pages(pages) = load else {
+                panic!("entry pages expected for {runs:?}: {load:?}");
+            };
+            let asked = runs.iter().map(|run| (run.end - run.start) as usize).sum::<usize>();
+            assert_eq!(statistics.disk_read_bytes() - before, asked * PAGE, "{runs:?}");
+            assert!(pages.head.is_empty());
+            assert_eq!((pages.key_len, pages.value_len), (0, 0));
+            for (run, bytes) in runs.iter().zip(&pages.runs) {
+                assert_value_bytes(bytes, run.start as usize * PAGE, len);
+            }
+        }
+
+        let past = store.load_range(hash, vec![2..4], true).await.unwrap_err();
         assert_eq!(past.kind(), ErrorKind::OutOfRange);
-        let unordered = store.load_range(hash, vec![2..3, 1..2]).await.unwrap_err();
+        let unordered = store.load_range(hash, vec![2..3, 1..2], true).await.unwrap_err();
         assert_eq!(unordered.kind(), ErrorKind::OutOfRange);
         assert!(matches!(
-            store.load_range(memory.hash(&2), vec![1..2]).await.unwrap(),
+            store.load_range(memory.hash(&2), vec![1..2], true).await.unwrap(),
             PageLoad::Miss
         ));
     }
@@ -1665,7 +1696,7 @@ mod tests {
         }
 
         assert!(matches!(
-            store.load_range(hash, vec![1..2]).await.unwrap(),
+            store.load_range(hash, vec![1..2], true).await.unwrap(),
             PageLoad::Miss
         ));
         assert!(!Engine::may_contains(&*store, hash));

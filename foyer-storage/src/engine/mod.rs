@@ -233,9 +233,16 @@ where
     /// the value checksum or deserialization: the caller verifies the bytes it uses. An engine that cannot read part
     /// of an entry returns [`PageLoad::Miss`].
     ///
-    /// Like [`Engine::load`], the result may belong to another key with the same hash.
-    fn load_range(&self, hash: u64, pages: Vec<Range<u32>>) -> BoxFuture<'static, Result<PageLoad<K, V, P>>> {
-        let _ = (hash, pages);
+    /// Like [`Engine::load`], the result may belong to another key with the same hash. Without `with_head` the first
+    /// page is not read unless a run asks for it, and the result's head is empty and its lengths zero: the caller
+    /// verifies the pages against what it already holds of the entry.
+    fn load_range(
+        &self,
+        hash: u64,
+        pages: Vec<Range<u32>>,
+        with_head: bool,
+    ) -> BoxFuture<'static, Result<PageLoad<K, V, P>>> {
+        let _ = (hash, pages, with_head);
         Box::pin(std::future::ready(Ok(PageLoad::Miss)))
     }
 

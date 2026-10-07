@@ -497,18 +497,19 @@ where
         &self.inner.storage
     }
 
-    /// Read the first page and the page runs `pages` of the disk cache entry of `key`, without its value checksum:
-    /// the caller verifies the bytes it uses. The in-memory cache is neither consulted nor filled; an entry still in
-    /// the disk cache write queue is returned whole.
+    /// Read the page runs `pages` of the disk cache entry of `key`, and its first page `with_head`, without its value
+    /// checksum: the caller verifies the bytes it uses. The in-memory cache is neither consulted nor filled; an entry
+    /// still in the disk cache write queue is returned whole.
     pub async fn load_pages<Q>(
         &self,
         key: &Q,
         pages: Vec<std::ops::Range<u32>>,
+        with_head: bool,
     ) -> Result<PageLoad<K, V, HybridCacheProperties>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.inner.storage.load_pages(key, pages).await
+        self.inner.storage.load_pages(key, pages, with_head).await
     }
 
     /// Enable tracing.
@@ -1202,7 +1203,7 @@ mod tests {
         hybrid.memory().remove(&1);
         hybrid.storage().wait().await;
 
-        let PageLoad::Pages(pages) = hybrid.load_pages(&1, vec![1..2]).await.unwrap() else {
+        let PageLoad::Pages(pages) = hybrid.load_pages(&1, vec![1..2], true).await.unwrap() else {
             panic!("the entry's pages");
         };
         assert_eq!(pages.runs.len(), 1);
@@ -1210,7 +1211,7 @@ mod tests {
         assert!(pages.runs[0].iter().all(|byte| *byte == 7));
         assert!(!hybrid.memory().contains(&1));
         assert!(matches!(
-            hybrid.load_pages(&2, vec![1..2]).await.unwrap(),
+            hybrid.load_pages(&2, vec![1..2], true).await.unwrap(),
             PageLoad::Miss
         ));
     }
