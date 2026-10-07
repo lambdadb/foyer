@@ -16,6 +16,7 @@ use std::{
     fmt::Debug,
     future::Future,
     marker::PhantomData,
+    ops::Range,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -24,6 +25,7 @@ use std::{
 };
 
 use asyncband::mpsc::UnboundedReceiver;
+use bytes::Bytes;
 #[cfg(feature = "tracing")]
 use fastrace::prelude::*;
 use foyer_common::{
@@ -52,7 +54,7 @@ use crate::{
     Device, Load, RejectAll, StorageFilter, StorageFilterResult,
     compress::Compression,
     engine::{
-        Engine, EngineBuildContext, EngineConfig, Populated,
+        Engine, EngineBuildContext, EngineConfig, EntryPages, PageLoad, Populated,
         block::{
             eviction::{EvictionPicker, FifoPicker, InvalidRatioPicker},
             manager::{BlockId, BlockManager},
@@ -64,7 +66,10 @@ use crate::{
         },
     },
     filter::conditions::IoThrottle,
-    io::{PAGE, bytes::IoSliceMut},
+    io::{
+        PAGE,
+        bytes::{IoB, IoSliceMut},
+    },
     keeper::PieceRef,
     serde::EntryDeserializer,
 };
@@ -784,6 +789,101 @@ where
         load
     }
 
+    fn load_range(
+        &self,
+        hash: u64,
+        pages: Vec<Range<u32>>,
+    ) -> impl Future<Output = Result<PageLoad<K, V, P>>> + Send + 'static {
+        tracing::trace!(hash, ?pages, "[block engine]: load range");
+
+        let indexer = self.inner.indexer.clone();
+        let block_manager = self.inner.block_manager.clone();
+
+        async move {
+            let addr = match indexer.get(hash) {
+                Some(addr) => addr,
+                None => return Ok(PageLoad::Miss),
+            };
+
+            let entry_pages = bits::align_up(PAGE, addr.len as usize) / PAGE;
+            let ordered = pages.iter().all(|run| run.start < run.end)
+                && pages.windows(2).all(|pair| pair[0].end <= pair[1].start)
+                && pages.last().is_none_or(|run| run.end as usize <= entry_pages);
+            if !ordered {
+                return Err(Error::new(
+                    ErrorKind::OutOfRange,
+                    "page runs must be sorted, disjoint and in the entry",
+                )
+                .with_context("pages", format!("{pages:?}"))
+                .with_context("entry_pages", entry_pages));
+            }
+
+            let block = block_manager.block(addr.block);
+            if block.partition().statistics().is_read_throttled() {
+                return Ok(PageLoad::Throttled);
+            }
+
+            // The header page is read on its own unless the first run starts with it.
+            let head_apart = pages.first().is_none_or(|run| run.start != 0);
+            let reads = head_apart.then_some(0..1).into_iter().chain(pages.iter().cloned());
+            let mut bufs = try_join_all(reads.map(|run| {
+                let block = block.clone();
+                async move {
+                    let len = (run.end - run.start) as usize * PAGE;
+                    let offset = addr.offset as u64 + u64::from(run.start) * PAGE as u64;
+                    let (buf, res) = block.read(Box::new(IoSliceMut::new(len)), offset).await;
+                    res.map(|()| Bytes::from_owner(PageBuf(buf)))
+                }
+            }))
+            .await
+            .inspect_err(|e| tracing::error!(hash, ?addr, ?e, "[block engine load range]: load error"))?;
+            let head = match head_apart {
+                true => bufs.remove(0),
+                false => bufs[0].slice(..PAGE),
+            };
+
+            let header = match EntryHeader::read(&head[..EntryHeader::serialized_len()]) {
+                Ok(header) if header.hash == hash => header,
+                Ok(header) => {
+                    tracing::warn!(
+                        hash,
+                        ?addr,
+                        ?header,
+                        "[block engine load range]: header hash mismatch, remove"
+                    );
+                    indexer.remove(hash, &addr, DepartureReason::ReadCorruption);
+                    return Ok(PageLoad::Miss);
+                }
+                Err(e) => {
+                    return match e.kind() {
+                        ErrorKind::Parse
+                        | ErrorKind::MagicMismatch
+                        | ErrorKind::ChecksumMismatch
+                        | ErrorKind::OutOfRange => {
+                            tracing::warn!(hash, ?addr, ?e, "[block engine load range]: bad header, remove");
+                            indexer.remove(hash, &addr, DepartureReason::ReadCorruption);
+                            Ok(PageLoad::Miss)
+                        }
+                        _ => Err(e),
+                    };
+                }
+            };
+            if header.compression != Compression::None {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "page reads need an uncompressed entry",
+                ));
+            }
+
+            Ok(PageLoad::Pages(EntryPages {
+                head,
+                runs: bufs,
+                key_len: header.key_len as _,
+                value_len: header.value_len as _,
+            }))
+        }
+    }
+
     fn delete(&self, hash: u64) {
         if !self.inner.active.load(Ordering::Relaxed) {
             tracing::warn!("cannot delete entry after closed");
@@ -861,6 +961,15 @@ where
     }
 }
 
+/// A device read handed out as [`Bytes`] without a copy.
+struct PageBuf(Box<dyn IoB>);
+
+impl AsRef<[u8]> for PageBuf {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 impl<K, V, P> Engine<K, V, P> for BlockEngine<K, V, P>
 where
     K: StorageKey,
@@ -892,6 +1001,10 @@ where
     fn load(&self, hash: u64) -> BoxFuture<'static, Result<Load<K, V, P>>> {
         // TODO(MrCroxx): refactor this.
         self.load(hash).boxed()
+    }
+
+    fn load_range(&self, hash: u64, pages: Vec<Range<u32>>) -> BoxFuture<'static, Result<PageLoad<K, V, P>>> {
+        self.load_range(hash, pages).boxed()
     }
 
     fn delete(&self, hash: u64) {
@@ -938,12 +1051,12 @@ mod tests {
     use crate::{
         PsyncIoEngineConfig, RejectAll,
         engine::{
-            RecoverMode,
+            ENTRY_VALUE_OFFSET, RecoverMode,
             block::observer::{Departure, DroppedWrite, RecoveryReport},
         },
         io::{
             device::{DeviceBuilder, combined::CombinedDeviceBuilder, file::FileDeviceBuilder, fs::FsDeviceBuilder},
-            engine::{IoEngine, IoEngineBuildContext, IoEngineConfig},
+            engine::{IoEngine, IoEngineBuildContext, IoEngineConfig, monitor::MonitoredIoEngine},
         },
         serde::EntrySerializer,
         test_utils::Biased,
@@ -961,11 +1074,13 @@ mod tests {
 
     async fn io_engine_for_test(spawner: Spawner) -> Arc<dyn IoEngine> {
         // TODO(MrCroxx): Test with other io engines.
-        PsyncIoEngineConfig::new()
+        let io_engine = PsyncIoEngineConfig::new()
             .boxed()
             .build(IoEngineBuildContext { spawner })
             .await
-            .unwrap()
+            .unwrap();
+        // Counts the device bytes a test reads, as a store does.
+        MonitoredIoEngine::new(io_engine, Arc::new(Metrics::noop()))
     }
 
     /// 4 files, fifo eviction, 16 KiB block, 64 KiB capacity.
@@ -1445,6 +1560,115 @@ mod tests {
         }
 
         assert!(store.load(memory.hash(&1)).await.unwrap().kv().is_none());
+    }
+
+    /// A test value whose byte `i` is `i % 251`, encoded after its `usize` length.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Every byte of `bytes`, which start at `entry_offset` of the entry, that falls in the value bytes of a
+    /// [`pattern`] of `len` bytes equals its pattern byte.
+    fn assert_value_bytes(bytes: &[u8], entry_offset: usize, len: usize) {
+        let data = ENTRY_VALUE_OFFSET + std::mem::size_of::<usize>();
+        for (at, byte) in bytes.iter().enumerate() {
+            let offset = entry_offset + at;
+            if (data..data + len).contains(&offset) {
+                assert_eq!(*byte, ((offset - data) % 251) as u8, "entry offset {offset}");
+            }
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_load_range_reads_the_header_page_and_the_asked_runs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let memory = cache_for_test();
+        let store = engine_for_test(dir.path()).await;
+        // Header, 8 length bytes, 8 KiB and an 8-byte key: three pages.
+        let len = 8 * KB;
+        enqueue(&store, memory.insert(1, pattern(len)));
+        store.wait().await;
+        let hash = memory.hash(&1);
+        let addr = store.inner.indexer.get(hash).unwrap();
+        let statistics = store
+            .inner
+            .block_manager
+            .block(addr.block)
+            .partition()
+            .statistics()
+            .clone();
+
+        // (runs, pages read): the header page is read apart unless the first run starts with it.
+        let cases = [
+            (vec![0..3], 3),
+            (vec![], 1),
+            (vec![2..3], 2),
+            (vec![1..2, 2..3], 3),
+            (vec![0..1, 2..3], 2),
+        ];
+        for (runs, pages_read) in cases {
+            let before = statistics.disk_read_bytes();
+            let load = store.load_range(hash, runs.clone()).await.unwrap();
+            let PageLoad::Pages(pages) = load else {
+                panic!("entry pages expected for {runs:?}: {load:?}");
+            };
+            assert_eq!(statistics.disk_read_bytes() - before, pages_read * PAGE, "{runs:?}");
+            assert_eq!(pages.value_len, std::mem::size_of::<usize>() + len);
+            assert_eq!(pages.key_len, std::mem::size_of::<u64>());
+            assert_eq!(pages.head.len(), PAGE);
+            assert_value_bytes(&pages.head, 0, len);
+            assert_eq!(pages.runs.len(), runs.len());
+            for (run, bytes) in runs.iter().zip(&pages.runs) {
+                assert_eq!(bytes.len(), (run.end - run.start) as usize * PAGE);
+                assert_value_bytes(bytes, run.start as usize * PAGE, len);
+            }
+        }
+
+        let past = store.load_range(hash, vec![2..4]).await.unwrap_err();
+        assert_eq!(past.kind(), ErrorKind::OutOfRange);
+        let unordered = store.load_range(hash, vec![2..3, 1..2]).await.unwrap_err();
+        assert_eq!(unordered.kind(), ErrorKind::OutOfRange);
+        assert!(matches!(
+            store.load_range(memory.hash(&2), vec![1..2]).await.unwrap(),
+            PageLoad::Miss
+        ));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_load_range_of_a_corrupt_header_is_a_miss_and_removes_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let memory = cache_for_test();
+        let store = engine_for_test(dir.path()).await;
+        enqueue(&store, memory.insert(1, pattern(7 * KB)));
+        store.wait().await;
+        let hash = memory.hash(&1);
+        let offset = store.inner.indexer.get(hash).unwrap().offset as u64;
+
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if !entry.metadata().unwrap().is_file() {
+                continue;
+            }
+            let file = File::options().write(true).open(entry.path()).unwrap();
+            #[cfg(target_family = "unix")]
+            {
+                use std::os::unix::fs::FileExt;
+                file.write_all_at(&[b'x'; 42], offset).unwrap();
+            }
+            #[cfg(target_family = "windows")]
+            {
+                use std::os::windows::fs::FileExt;
+                file.seek_write(&[b'x'; 42], offset).unwrap();
+            }
+        }
+
+        assert!(matches!(
+            store.load_range(hash, vec![1..2]).await.unwrap(),
+            PageLoad::Miss
+        ));
+        assert!(!Engine::may_contains(&*store, hash));
     }
 
     #[test_log::test(tokio::test)]
@@ -2047,7 +2271,11 @@ mod tests {
             let store = engine_for_many_entries(dir.path(), recorder.clone()).await;
             let report = recorder.recoveries.lock()[0];
             assert_eq!(report.truncated_records, 0, "round {round}");
-            assert_eq!(report.restored_entries, (SUBMITTERS * ENTRIES) as usize, "round {round}");
+            assert_eq!(
+                report.restored_entries,
+                (SUBMITTERS * ENTRIES) as usize,
+                "round {round}"
+            );
             for key in 0..SUBMITTERS * ENTRIES {
                 assert!(
                     store.inner.indexer.get(memory.hash(&key)).is_some(),

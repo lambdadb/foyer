@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{any::TypeId, borrow::Cow, fmt::Debug, hash::Hash, sync::Arc, time::Instant};
+use std::{any::TypeId, borrow::Cow, fmt::Debug, hash::Hash, ops::Range, sync::Arc, time::Instant};
 
 use equivalent::Equivalent;
 use foyer_common::{
@@ -30,7 +30,7 @@ use crate::{
     StorageFilterResult,
     compress::Compression,
     engine::{
-        Engine, EngineBuildContext, EngineConfig, Load, Populated, RecoverMode,
+        Engine, EngineBuildContext, EngineConfig, Load, PageLoad, Populated, RecoverMode,
         noop::{NoopEngine, NoopEngineConfig},
     },
     io::{
@@ -277,6 +277,30 @@ where
                 Err(e)
             }
         }
+    }
+
+    /// Load the first page and the page runs `pages` of a cache entry from the disk cache, without the value
+    /// checksum: see [`Engine::load_range`]. An entry still in the write queue is returned whole.
+    pub async fn load_pages<Q>(&self, key: &Q, pages: Vec<Range<u32>>) -> Result<PageLoad<K, V, P>>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        let hash = self.inner.hasher.hash_one(key);
+
+        if let Some(piece) = self.inner.keeper.get(hash, key) {
+            tracing::trace!(hash, "[store]: load pages from keeper");
+            self.inner.metrics.storage_hit.increase(1);
+            return Ok(PageLoad::Piece(piece));
+        }
+
+        let load = self.inner.engine.load_range(hash, pages).await;
+        match &load {
+            Ok(PageLoad::Pages(_)) | Ok(PageLoad::Piece(_)) => self.inner.metrics.storage_hit.increase(1),
+            Ok(PageLoad::Miss) => self.inner.metrics.storage_miss.increase(1),
+            Ok(PageLoad::Throttled) => self.inner.metrics.storage_throttled.increase(1),
+            Err(_) => self.inner.metrics.storage_error.increase(1),
+        }
+        load
     }
 
     /// Delete the cache entry with the given key from the disk cache.

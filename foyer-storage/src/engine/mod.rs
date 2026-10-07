@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{any::Any, fmt::Debug, sync::Arc};
+use std::{any::Any, fmt::Debug, ops::Range, sync::Arc};
 
+use bytes::Bytes;
 use foyer_common::{
     code::{StorageKey, StorageValue},
     error::Result,
@@ -103,6 +104,46 @@ impl<K, V, P> Load<K, V, P> {
     }
 }
 
+/// Pages of a disk cache entry, read without the entry's value checksum: the entry is `PAGE`-aligned on the device,
+/// its header in its first page, its serialized value from [`ENTRY_VALUE_OFFSET`], its key after the value.
+#[derive(Debug, Clone)]
+pub struct EntryPages {
+    /// The entry's first page, which holds its header; the header's magic and hash are verified.
+    pub head: Bytes,
+    /// The pages of each requested run, in request order.
+    pub runs: Vec<Bytes>,
+    /// The serialized key length the header records.
+    pub key_len: usize,
+    /// The serialized value length the header records.
+    pub value_len: usize,
+}
+
+/// Where an entry's serialized value starts within the entry: right after its header.
+pub const ENTRY_VALUE_OFFSET: usize = block::serde::EntryHeader::serialized_len();
+
+/// Page load result.
+pub enum PageLoad<K, V, P> {
+    /// The requested pages of the entry on the device.
+    Pages(EntryPages),
+    /// The entry is in the disk cache write queue, whole.
+    Piece(Piece<K, V, P>),
+    /// The entry may be in the disk cache, the read io is throttled.
+    Throttled,
+    /// Disk cache miss.
+    Miss,
+}
+
+impl<K, V, P> Debug for PageLoad<K, V, P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PageLoad::Pages(pages) => f.debug_tuple("PageLoad::Pages").field(pages).finish(),
+            PageLoad::Piece(piece) => f.debug_tuple("PageLoad::Piece").field(piece).finish(),
+            PageLoad::Throttled => f.debug_struct("PageLoad::Throttled").finish(),
+            PageLoad::Miss => f.debug_struct("PageLoad::Miss").finish(),
+        }
+    }
+}
+
 /// The recover mode of the disk cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -187,6 +228,16 @@ where
     /// `load` may return a false-positive result on entry key hash collision. It's the caller's responsibility to
     /// check if the returned key matches the given key.
     fn load(&self, hash: u64) -> BoxFuture<'static, Result<Load<K, V, P>>>;
+
+    /// Read the first page of a cache entry and the page runs `pages` (sorted, disjoint, within the entry), without
+    /// the value checksum or deserialization: the caller verifies the bytes it uses. An engine that cannot read part
+    /// of an entry returns [`PageLoad::Miss`].
+    ///
+    /// Like [`Engine::load`], the result may belong to another key with the same hash.
+    fn load_range(&self, hash: u64, pages: Vec<Range<u32>>) -> BoxFuture<'static, Result<PageLoad<K, V, P>>> {
+        let _ = (hash, pages);
+        Box::pin(std::future::ready(Ok(PageLoad::Miss)))
+    }
 
     /// Delete the cache entry with the given key from the disk cache.
     fn delete(&self, hash: u64);

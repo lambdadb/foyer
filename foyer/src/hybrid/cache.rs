@@ -41,7 +41,7 @@ use foyer_common::{
     rate::RateLimiter,
 };
 use foyer_memory::{Cache, CacheEntry, FetchTarget, GetOrFetch, Piece, Pipe};
-use foyer_storage::{Load, Populated, Statistics, Store};
+use foyer_storage::{Load, PageLoad, Populated, Statistics, Store};
 use futures_util::FutureExt as _;
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
@@ -495,6 +495,20 @@ where
     /// Access the disk cache.
     pub fn storage(&self) -> &Store<K, V, S, HybridCacheProperties> {
         &self.inner.storage
+    }
+
+    /// Read the first page and the page runs `pages` of the disk cache entry of `key`, without its value checksum:
+    /// the caller verifies the bytes it uses. The in-memory cache is neither consulted nor filled; an entry still in
+    /// the disk cache write queue is returned whole.
+    pub async fn load_pages<Q>(
+        &self,
+        key: &Q,
+        pages: Vec<std::ops::Range<u32>>,
+    ) -> Result<PageLoad<K, V, HybridCacheProperties>>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.inner.storage.load_pages(key, pages).await
     }
 
     /// Enable tracing.
@@ -1177,6 +1191,28 @@ mod tests {
         assert!(hybrid.contains(&1));
         hybrid.remove(&1);
         assert!(!hybrid.contains(&1));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_load_pages_reads_the_disk_entry_and_leaves_memory_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let hybrid = open(dir.path()).await;
+
+        hybrid.storage_writer(1).insert(vec![7; 12 * KB]).unwrap();
+        hybrid.memory().remove(&1);
+        hybrid.storage().wait().await;
+
+        let PageLoad::Pages(pages) = hybrid.load_pages(&1, vec![1..2]).await.unwrap() else {
+            panic!("the entry's pages");
+        };
+        assert_eq!(pages.runs.len(), 1);
+        assert_eq!(pages.runs[0].len(), 4 * KB);
+        assert!(pages.runs[0].iter().all(|byte| *byte == 7));
+        assert!(!hybrid.memory().contains(&1));
+        assert!(matches!(
+            hybrid.load_pages(&2, vec![1..2]).await.unwrap(),
+            PageLoad::Miss
+        ));
     }
 
     #[test_log::test(tokio::test)]

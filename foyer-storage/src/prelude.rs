@@ -17,7 +17,8 @@ pub use crate::io::engine::uring::{UringIoEngine, UringIoEngineConfig};
 pub use crate::{
     compress::Compression,
     engine::{
-        Engine, EngineBuildContext, EngineConfig, Load, Populated, RecoverMode,
+        ENTRY_VALUE_OFFSET, Engine, EngineBuildContext, EngineConfig, EntryPages, Load, PageLoad, Populated,
+        RecoverMode,
         block::{
             engine::BlockEngineConfig,
             eviction::{EvictionInfo, EvictionPicker, FifoPicker, InvalidRatioPicker},
