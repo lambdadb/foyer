@@ -17,9 +17,37 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(miri))]
 use fastant::{Atomic, Instant};
+#[cfg(miri)]
+use miri_clock::{Atomic, Instant};
 
 use crate::Throttle;
+
+/// fastant probes the TSC with `cpuid` inline assembly from a load-time constructor on x86 Linux, which Miri cannot
+/// interpret, so Miri builds drop the dependency and use the standard clock.
+#[cfg(miri)]
+mod miri_clock {
+    use std::sync::{atomic::Ordering, Mutex};
+    pub use std::time::Instant;
+
+    #[derive(Debug)]
+    pub struct Atomic(Mutex<Instant>);
+
+    impl Atomic {
+        pub fn new(instant: Instant) -> Self {
+            Self(Mutex::new(instant))
+        }
+
+        pub fn load(&self, _: Ordering) -> Instant {
+            *self.0.lock().unwrap()
+        }
+
+        pub fn store(&self, instant: Instant, _: Ordering) {
+            *self.0.lock().unwrap() = instant;
+        }
+    }
+}
 
 #[derive(Debug)]
 struct Metric {

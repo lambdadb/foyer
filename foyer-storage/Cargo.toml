@@ -32,7 +32,6 @@ asyncband = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, optional = true }
 equivalent = { workspace = true }
-fastant = { workspace = true, features = ["atomic"] }
 fastrace = { workspace = true, optional = true }
 foyer-common = { workspace = true }
 foyer-memory = { workspace = true }
@@ -55,6 +54,9 @@ zstd = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 core_affinity = { workspace = true }
 io-uring = { workspace = true }
+
+[target.'cfg(not(miri))'.dependencies]
+fastant = { workspace = true, features = ["atomic"] }
 
 [dev-dependencies]
 bytesize = { workspace = true }
