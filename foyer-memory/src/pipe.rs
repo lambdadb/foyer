@@ -30,6 +30,8 @@ pub struct Piece<K, V, P> {
     value: *const V,
     hash: u64,
     properties: *const P,
+    /// The in-memory cache the record belongs to, or 0 when the piece was made outside of one.
+    home: usize,
     drop_fn: fn(*const ()),
 }
 
@@ -72,6 +74,7 @@ impl<K, V, P> Clone for Piece<K, V, P> {
             value: self.value,
             hash: self.hash,
             properties: self.properties,
+            home: self.home,
             drop_fn: self.drop_fn,
         }
     }
@@ -98,8 +101,20 @@ impl<K, V, P> Piece<K, V, P> {
             value,
             hash,
             properties,
+            home: 0,
             drop_fn,
         }
+    }
+
+    /// Mark the piece as a record of the in-memory cache identified by `home`.
+    pub(crate) fn at_home(mut self, home: usize) -> Self {
+        self.home = home;
+        self
+    }
+
+    /// The in-memory cache the record belongs to, or 0 when the piece was made outside of one.
+    pub(crate) fn home(&self) -> usize {
+        self.home
     }
 
     /// Get the key of the record.

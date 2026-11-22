@@ -729,6 +729,7 @@ where
 
         let ctx = Arc::new(GetOrFetchCtx::default());
         let store = self.inner.storage.clone();
+        let memory = self.inner.memory.clone();
         let spawner = self.inner.storage.spawner();
         let inner = self.inner.memory.get_or_fetch_inner(
             key,
@@ -747,7 +748,12 @@ where
                                 Ok(Some(FetchTarget::Entry { value, properties }))
                             }
                             // TODO(MrCroxx): Remove populated with piece?
-                            Ok(Load::Piece { piece, populated: _ }) => Ok(Some(FetchTarget::Piece(piece))),
+                            Ok(Load::Piece { piece, populated: _ }) if memory.is_home_of(&piece) => {
+                                Ok(Some(FetchTarget::Piece(piece)))
+                            }
+                            // A queued record of another cache over the same store: that cache still indexes
+                            // and accounts for it, so it is a miss here until it is on disk.
+                            Ok(Load::Piece { .. }) => Ok(None),
                             Ok(Load::Throttled) => {
                                 ctx.throttled.store(true, Ordering::Relaxed);
                                 Ok(None)
@@ -793,6 +799,7 @@ where
 
         let ctx = Arc::new(GetOrFetchCtx::default());
         let store = self.inner.storage.clone();
+        let memory = self.inner.memory.clone();
         let spawner = self.inner.storage.spawner();
         let fut = fetch();
         let inner = self.inner.memory.get_or_fetch_inner(
@@ -814,7 +821,12 @@ where
                                 Ok(Some(FetchTarget::Entry { value, properties }))
                             }
                             // TODO(MrCroxx): Remove populated with piece?
-                            Ok(Load::Piece { piece, populated: _ }) => Ok(Some(FetchTarget::Piece(piece))),
+                            Ok(Load::Piece { piece, populated: _ }) if memory.is_home_of(&piece) => {
+                                Ok(Some(FetchTarget::Piece(piece)))
+                            }
+                            // A queued record of another cache over the same store: that cache still indexes
+                            // and accounts for it, so it is a miss here until it is on disk.
+                            Ok(Load::Piece { .. }) => Ok(None),
                             Ok(Load::Throttled) => {
                                 ctx.throttled.store(true, Ordering::Relaxed);
                                 Ok(None)
@@ -1231,6 +1243,35 @@ mod tests {
         owner.memory().remove(&2);
         owner.storage().wait().await;
         assert_eq!(owner.get(&2).await.unwrap().unwrap().value(), &vec![9; 12 * KB]);
+        owner.close().await.unwrap();
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_a_cache_over_a_shared_store_adopts_no_queued_record_of_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = open(dir.path()).await;
+        let sharer = HybridCacheBuilder::new()
+            .with_name("sharer")
+            .with_policy(HybridCachePolicy::WriteOnInsertion)
+            .memory(4 * MB)
+            .with_hash_builder(ModHasher::default())
+            .storage()
+            .build_with_store_of(&owner);
+
+        // The sharer's memory holds the record while the store's write queue does.
+        let held = sharer.insert(1, vec![7; 12 * KB]);
+        // The owner finds the entry on disk or not at all, never as the sharer's record.
+        if let Some(loaded) = owner.get(&1).await.unwrap() {
+            assert_eq!(loaded.source(), Source::Disk);
+        }
+        assert!(sharer.memory().contains(&1));
+        drop(held);
+
+        owner.storage().wait().await;
+        let loaded = owner.get(&1).await.unwrap().unwrap();
+        assert_eq!(loaded.value(), &vec![7; 12 * KB]);
+        assert_eq!(sharer.get(&1).await.unwrap().unwrap().source(), Source::Memory);
+        sharer.close().await.unwrap();
         owner.close().await.unwrap();
     }
 

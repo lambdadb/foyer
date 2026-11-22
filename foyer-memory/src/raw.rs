@@ -450,6 +450,28 @@ where
     }
 }
 
+fn home_of<E, S, I>(inner: &Arc<RawCacheInner<E, S, I>>) -> usize
+where
+    E: Eviction,
+    S: HashBuilder,
+    I: Indexer<Eviction = E>,
+{
+    Arc::as_ptr(inner) as *const () as usize
+}
+
+/// A piece of `record`, a record of the cache of `inner`.
+fn piece_of<E, S, I>(
+    inner: &Arc<RawCacheInner<E, S, I>>,
+    record: Arc<Record<E>>,
+) -> Piece<E::Key, E::Value, E::Properties>
+where
+    E: Eviction,
+    S: HashBuilder,
+    I: Indexer<Eviction = E>,
+{
+    Piece::new(record).at_home(home_of(inner))
+}
+
 pub struct RawCache<E, S, I>
 where
     E: Eviction,
@@ -558,7 +580,7 @@ where
                                 listener.on_leave(event, record.key(), record.value())
                             }
                             if piped && event == Event::Evict {
-                                pipe.send(Piece::new(record));
+                                pipe.send(piece_of(&inner, record));
                             }
                         }
                     }
@@ -629,6 +651,13 @@ where
         self.insert_inner(record, source)
     }
 
+    /// Whether `piece` is a record of this cache, or one made outside of any cache. A cache must not insert the
+    /// piece of another cache's record: that cache still indexes and accounts for the record.
+    #[doc(hidden)]
+    pub fn is_home_of(&self, piece: &Piece<E::Key, E::Value, E::Properties>) -> bool {
+        piece.home() == 0 || piece.home() == home_of(&self.inner)
+    }
+
     #[doc(hidden)]
     #[cfg_attr(feature = "tracing", fastrace::trace(name = "foyer::memory::raw::insert_piece"))]
     pub fn insert_piece(&self, piece: Piece<E::Key, E::Value, E::Properties>) -> RawCacheEntry<E, S, I> {
@@ -662,7 +691,7 @@ where
                     listener.on_leave(event, record.key(), record.value())
                 }
                 if piped && event == Event::Evict {
-                    self.pipe.send(Piece::new(record));
+                    self.pipe.send(piece_of(&self.inner, record));
                 }
             }
         }
@@ -691,7 +720,7 @@ where
                     listener.on_leave(event, record.key(), record.value())
                 }
                 if piped && event == Event::Evict {
-                    self.pipe.send(Piece::new(record));
+                    self.pipe.send(piece_of(&self.inner, record));
                 }
             }
         }
@@ -721,7 +750,10 @@ where
             }
         }
         if piped {
-            let pieces = garbages.into_iter().map(|(_, record)| Piece::new(record)).collect_vec();
+            let pieces = garbages
+                .into_iter()
+                .map(|(_, record)| piece_of(&self.inner, record))
+                .collect_vec();
             self.pipe.flush(pieces).await;
         }
     }
@@ -933,7 +965,7 @@ where
                     listener.on_leave(Event::Evict, self.record.key(), self.record.value());
                 }
                 if self.pipe.is_enabled() {
-                    self.pipe.send(Piece::new(self.record.clone()));
+                    self.pipe.send(piece_of(&self.inner, self.record.clone()));
                 }
                 return;
             }
@@ -1028,7 +1060,7 @@ where
     }
 
     pub fn piece(&self) -> Piece<E::Key, E::Value, E::Properties> {
-        Piece::new(self.record.clone())
+        piece_of(&self.inner, self.record.clone())
     }
 
     pub fn source(&self) -> Source {

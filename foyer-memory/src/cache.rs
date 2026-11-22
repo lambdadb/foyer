@@ -731,6 +731,18 @@ where
         }
     }
 
+    /// Whether `piece` is a record of this cache, or one made outside of any cache.
+    #[doc(hidden)]
+    pub fn is_home_of(&self, piece: &Piece<K, V, P>) -> bool {
+        match self {
+            Cache::Fifo(cache) => cache.is_home_of(piece),
+            Cache::S3Fifo(cache) => cache.is_home_of(piece),
+            Cache::Lru(cache) => cache.is_home_of(piece),
+            Cache::Lfu(cache) => cache.is_home_of(piece),
+            Cache::Sieve(cache) => cache.is_home_of(piece),
+        }
+    }
+
     #[doc(hidden)]
     #[cfg_attr(feature = "tracing", fastrace::trace(name = "foyer::memory::cache::insert_inner"))]
     pub fn insert_piece(&self, piece: Piece<K, V, P>) -> CacheEntry<K, V, S, P> {

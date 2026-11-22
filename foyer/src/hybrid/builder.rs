@@ -349,7 +349,14 @@ where
             self.memory
         };
 
-        Ok(HybridCache::new(self.name, self.options, memory, storage, self.metrics, true))
+        Ok(HybridCache::new(
+            self.name,
+            self.options,
+            memory,
+            storage,
+            self.metrics,
+            true,
+        ))
     }
 
     /// Build the hybrid cache over the disk cache store of `owner` instead of a store of its own.
