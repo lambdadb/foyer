@@ -254,6 +254,10 @@ where
     /// `contains` may return a false-positive result if there is a hash collision with the given key.
     fn may_contains(&self, hash: u64) -> bool;
 
+    /// Counts a use of the entry of `hash` on the block that holds it, without reading it. `false` when the index
+    /// holds no such entry.
+    fn touch(&self, hash: u64) -> bool;
+
     /// Delete all cached entries of the disk cache.
     fn destroy(&self) -> BoxFuture<'static, Result<()>>;
 

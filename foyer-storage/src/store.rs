@@ -335,6 +335,15 @@ where
         self.inner.keeper.contains(hash, key) || self.inner.engine.may_contains(hash)
     }
 
+    /// Counts a use of the entry of `key` on the block that holds it, without reading it. `false` when the disk
+    /// cache holds no such entry.
+    pub fn touch<Q>(&self, key: &Q) -> bool
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.inner.engine.touch(self.inner.hasher.hash_one(key))
+    }
+
     /// Delete all cached entries of the disk cache.
     pub async fn destroy(&self) -> Result<()> {
         self.inner.engine.destroy().await

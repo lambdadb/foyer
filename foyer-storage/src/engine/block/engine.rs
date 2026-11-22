@@ -696,6 +696,7 @@ where
             tracing::trace!(hash, ?addr, "[block engine]: load");
 
             let block = block_manager.block(addr.block);
+            block.statistics().access.fetch_add(1, Ordering::Relaxed);
             if block.partition().statistics().is_read_throttled() {
                 return Ok(Load::Throttled);
             }
@@ -820,6 +821,7 @@ where
             }
 
             let block = block_manager.block(addr.block);
+            block.statistics().access.fetch_add(1, Ordering::Relaxed);
             if block.partition().statistics().is_read_throttled() {
                 return Ok(PageLoad::Throttled);
             }
@@ -920,6 +922,19 @@ where
 
     fn may_contains(&self, hash: u64) -> bool {
         self.inner.indexer.get(hash).is_some()
+    }
+
+    fn touch(&self, hash: u64) -> bool {
+        let Some(addr) = self.inner.indexer.get(hash) else {
+            return false;
+        };
+        self.inner
+            .block_manager
+            .block(addr.block)
+            .statistics()
+            .access
+            .fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     fn destroy(&self) -> BoxFuture<'static, Result<()>> {
@@ -1028,6 +1043,10 @@ where
 
     fn may_contains(&self, hash: u64) -> bool {
         self.may_contains(hash)
+    }
+
+    fn touch(&self, hash: u64) -> bool {
+        self.touch(hash)
     }
 
     fn destroy(&self) -> BoxFuture<'static, Result<()>> {
@@ -1592,6 +1611,38 @@ mod tests {
                 assert_eq!(*byte, ((offset - data) % 251) as u8, "entry offset {offset}");
             }
         }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_a_block_counts_the_loads_and_touches_of_its_entries() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let memory = cache_for_test();
+        let store = engine_for_test(dir.path()).await;
+        enqueue(&store, memory.insert(1, pattern(8 * KB)));
+        store.wait().await;
+        let hash = memory.hash(&1);
+        let addr = store.inner.indexer.get(hash).unwrap();
+        let block = store.inner.block_manager.block(addr.block);
+        let uses = || block.statistics().access.load(Ordering::Relaxed);
+        assert_eq!(uses(), 0);
+
+        assert!(store.load(hash).await.unwrap().kv().is_some());
+        assert_eq!(uses(), 1);
+        assert!(matches!(
+            store.load_range(hash, vec![0..1], true).await.unwrap(),
+            PageLoad::Pages(_)
+        ));
+        assert_eq!(uses(), 2);
+
+        // A touch counts without reading the device.
+        let read_ios = block.partition().statistics().disk_read_ios();
+        assert!(store.touch(hash));
+        assert_eq!(uses(), 3);
+        assert_eq!(block.partition().statistics().disk_read_ios(), read_ios);
+
+        assert!(!store.touch(memory.hash(&2)));
+        assert_eq!(uses(), 3);
     }
 
     #[test_log::test(tokio::test)]

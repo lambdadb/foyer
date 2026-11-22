@@ -141,6 +141,10 @@ where
         false
     }
 
+    fn touch(&self, _: u64) -> bool {
+        false
+    }
+
     fn destroy(&self) -> BoxFuture<'static, Result<()>> {
         async move { Ok(()) }.boxed()
     }

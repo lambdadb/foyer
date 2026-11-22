@@ -28,7 +28,7 @@ use crate::Throttle;
 /// interpret, so Miri builds drop the dependency and use the standard clock.
 #[cfg(miri)]
 mod miri_clock {
-    use std::sync::{atomic::Ordering, Mutex};
+    use std::sync::{Mutex, atomic::Ordering};
     pub use std::time::Instant;
 
     #[derive(Debug)]
