@@ -349,6 +349,24 @@ where
             self.memory
         };
 
-        Ok(HybridCache::new(self.name, self.options, memory, storage, self.metrics))
+        Ok(HybridCache::new(self.name, self.options, memory, storage, self.metrics, true))
+    }
+
+    /// Build the hybrid cache over the disk cache store of `owner` instead of a store of its own.
+    ///
+    /// The caches share the store's device, write queue, index and eviction, and each keeps its own in-memory cache:
+    /// an entry one of them writes is one the others load. They must hash a key alike. The disk cache configurations
+    /// of this builder are not used.
+    ///
+    /// The store closes with `owner`: closing this cache flushes its in-memory cache as configured and leaves the
+    /// store open.
+    pub fn build_with_store_of(self, owner: &HybridCache<K, V, S>) -> HybridCache<K, V, S> {
+        let storage = owner.storage().clone();
+        let memory = if storage.is_enabled() && self.options.policy == HybridCachePolicy::WriteOnEviction {
+            self.memory.with_pipe(Arc::new(HybridCachePipe::new(storage.clone())))
+        } else {
+            self.memory
+        };
+        HybridCache::new(self.name, self.options, memory, storage, self.metrics, false)
     }
 }

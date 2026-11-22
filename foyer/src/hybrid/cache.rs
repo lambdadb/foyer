@@ -298,6 +298,8 @@ where
     closed: Arc<AtomicBool>,
     memory: Cache<K, V, S, HybridCacheProperties>,
     storage: Store<K, V, S, HybridCacheProperties>,
+    /// Whether closing this cache closes `storage`: not for a cache built over the store of another.
+    owns_storage: bool,
     #[cfg(feature = "tracing")]
     tracing: std::sync::atomic::AtomicBool,
     #[cfg(feature = "tracing")]
@@ -315,6 +317,7 @@ where
         memory: Cache<K, V, S, HybridCacheProperties>,
         storage: Store<K, V, S, HybridCacheProperties>,
         flush_on_close: bool,
+        owns_storage: bool,
     ) -> Result<()> {
         if closed.fetch_or(true, Ordering::Relaxed) {
             return Ok(());
@@ -326,7 +329,9 @@ where
             tracing::info!(bytes, "[hybrid]: flush all in-memory cached entries to disk on close");
             memory.flush().await;
         }
-        storage.close().await?;
+        if owns_storage {
+            storage.close().await?;
+        }
 
         let elapsed = now.elapsed();
         tracing::info!("[hybrid]: close consumes {elapsed:?}");
@@ -339,6 +344,7 @@ where
             self.memory.clone(),
             self.storage.clone(),
             self.flush_on_close,
+            self.owns_storage,
         )
         .await
     }
@@ -356,9 +362,10 @@ where
         let memory = self.memory.clone();
         let storage = self.storage.clone();
         let flush_on_close = self.flush_on_close;
+        let owns_storage = self.owns_storage;
 
         self.storage.spawner().spawn(async move {
-            if let Err(e) = Self::close_inner(closed, memory, storage, flush_on_close).await {
+            if let Err(e) = Self::close_inner(closed, memory, storage, flush_on_close, owns_storage).await {
                 tracing::error!(?name, ?e, "[hybrid]: failed to close hybrid cache");
             }
         });
@@ -442,6 +449,7 @@ where
         memory: Cache<K, V, S, HybridCacheProperties>,
         storage: Store<K, V, S, HybridCacheProperties>,
         metrics: Arc<Metrics>,
+        owns_storage: bool,
     ) -> Self {
         let policy = options.policy;
         let flush_on_close = options.flush_on_close;
@@ -461,6 +469,7 @@ where
             closed,
             memory,
             storage,
+            owns_storage,
             metrics,
             #[cfg(feature = "tracing")]
             tracing,
@@ -1192,6 +1201,37 @@ mod tests {
         assert!(hybrid.contains(&1));
         hybrid.remove(&1);
         assert!(!hybrid.contains(&1));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_caches_over_one_store_load_what_the_other_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = open(dir.path()).await;
+        let sharer = HybridCacheBuilder::new()
+            .with_name("sharer")
+            .memory(4 * MB)
+            .with_hash_builder(ModHasher::default())
+            .storage()
+            .build_with_store_of(&owner);
+        assert!(sharer.is_hybrid());
+
+        sharer.storage_writer(1).insert(vec![7; 12 * KB]).unwrap();
+        sharer.memory().remove(&1);
+        owner.storage().wait().await;
+
+        let loaded = owner.get(&1).await.unwrap().unwrap();
+        assert_eq!(loaded.value(), &vec![7; 12 * KB]);
+        assert_eq!(loaded.source(), Source::Disk);
+        assert!(owner.memory().contains(&1));
+        assert!(!sharer.memory().contains(&1));
+
+        // Closing the sharer leaves the owner's store open.
+        sharer.close().await.unwrap();
+        owner.storage_writer(2).insert(vec![9; 12 * KB]).unwrap();
+        owner.memory().remove(&2);
+        owner.storage().wait().await;
+        assert_eq!(owner.get(&2).await.unwrap().unwrap().value(), &vec![9; 12 * KB]);
+        owner.close().await.unwrap();
     }
 
     #[test_log::test(tokio::test)]
