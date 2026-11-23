@@ -726,6 +726,50 @@ where
         }
     }
 
+    /// What `f` makes of the entry the shard's eviction order takes next, of its key, value and weight; `None`
+    /// when the order has no entry to take, or its algorithm cannot tell which is next.
+    ///
+    /// `f` is called while holding the shard lock and must not access this cache.
+    pub fn peek_next<R>(&self, shard: usize, f: impl FnOnce(&E::Key, &E::Value, usize) -> R) -> Option<R> {
+        let shard = self.inner.shards[shard].read();
+        shard
+            .eviction
+            .front()
+            .map(|record| f(record.key(), record.value(), record.weight()))
+    }
+
+    /// Evict the entry the shard's eviction order takes next, if `take` says so of it, and return its weight.
+    ///
+    /// A pool that several caches share takes its room this way: from the cache whose next entry it would
+    /// rather lose. `take` is called while holding the shard lock and must not access this cache.
+    pub fn evict_next_if(&self, shard: usize, take: impl FnOnce(&E::Key, &E::Value) -> bool) -> Option<usize> {
+        let mut garbages = vec![];
+        let weight = {
+            let mut shard = self.inner.shards[shard].write();
+            let front = shard.eviction.front()?;
+            if !take(front.key(), front.value()) {
+                return None;
+            }
+            let weight = front.weight();
+            let target = shard.usage - weight;
+            shard.evict(target, &mut garbages);
+            shard.metrics.memory_usage.decrease(weight as _);
+            weight
+        };
+
+        // Deallocate data out of the lock critical section.
+        let piped = self.pipe.is_enabled();
+        for (event, record) in garbages {
+            if let Some(listener) = self.inner.event_listener.as_ref() {
+                listener.on_leave(event, record.key(), record.value())
+            }
+            if piped && event == Event::Evict {
+                self.pipe.send(piece_of(&self.inner, record));
+            }
+        }
+        Some(weight)
+    }
+
     /// Evict all entries in the cache and offload them into the disk cache via the pipe if needed.
     ///
     /// This function obeys the io throttler of the disk cache and make sure all entries will be offloaded.

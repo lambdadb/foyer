@@ -193,6 +193,13 @@ where
         Some(record)
     }
 
+    fn front(&self) -> Option<&Record<Self>> {
+        self.list
+            .front()
+            .get()
+            .or_else(|| self.high_priority_list.front().get())
+    }
+
     fn remove(&mut self, record: &Arc<Record<Self>>) {
         let state = unsafe { &mut *record.state().get() };
 

@@ -115,6 +115,12 @@ pub trait Eviction: Send + Sync + 'static + Sized {
     /// The cache eviction algorithm instance MUST remove the record and set its `IN_EVICTION` flag to false.
     fn pop(&mut self) -> Option<Arc<Record<Self>>>;
 
+    /// The record `pop` would return, without popping it; `None` when there is none, or when the algorithm
+    /// cannot tell without popping.
+    fn front(&self) -> Option<&Record<Self>> {
+        None
+    }
+
     /// Remove a record from the cache eviction algorithm instance.
     ///
     /// The caller guarantees that the record is in the cache eviction algorithm instance.

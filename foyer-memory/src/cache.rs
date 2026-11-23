@@ -923,6 +923,34 @@ where
         }
     }
 
+    /// What `f` makes of the entry the shard's eviction order takes next, of its key, value and weight; `None`
+    /// when the order has no entry to take, or its algorithm cannot tell which is next (only LRU can).
+    ///
+    /// `f` is called while holding the shard lock and must not access this cache.
+    pub fn peek_next<R>(&self, shard: usize, f: impl FnOnce(&K, &V, usize) -> R) -> Option<R> {
+        match self {
+            Cache::Fifo(cache) => cache.peek_next(shard, f),
+            Cache::S3Fifo(cache) => cache.peek_next(shard, f),
+            Cache::Lru(cache) => cache.peek_next(shard, f),
+            Cache::Lfu(cache) => cache.peek_next(shard, f),
+            Cache::Sieve(cache) => cache.peek_next(shard, f),
+        }
+    }
+
+    /// Evict the entry the shard's eviction order takes next, if `take` says so of it, and return its weight.
+    ///
+    /// A pool that several caches share takes its room this way: from the cache whose next entry it would
+    /// rather lose. `take` is called while holding the shard lock and must not access this cache.
+    pub fn evict_next_if(&self, shard: usize, take: impl FnOnce(&K, &V) -> bool) -> Option<usize> {
+        match self {
+            Cache::Fifo(cache) => cache.evict_next_if(shard, take),
+            Cache::S3Fifo(cache) => cache.evict_next_if(shard, take),
+            Cache::Lru(cache) => cache.evict_next_if(shard, take),
+            Cache::Lfu(cache) => cache.evict_next_if(shard, take),
+            Cache::Sieve(cache) => cache.evict_next_if(shard, take),
+        }
+    }
+
     /// Evict all entries in the cache and offload them into the disk cache via the pipe if needed.
     ///
     /// This function obeys the io throttler of the disk cache and make sure all entries will be offloaded.
@@ -1226,6 +1254,33 @@ mod tests {
             (false, true)
         );
         assert_eq!(lru(|cache| drop(cache.get(&1))), (true, false));
+    }
+
+    #[test]
+    fn test_evict_next_if_takes_the_next_entry_only() {
+        let cache: Cache<u64, u64> = CacheBuilder::new(8)
+            .with_shards(1)
+            .with_eviction_config(LruConfig {
+                high_priority_pool_ratio: 0.0,
+            })
+            .build();
+        for key in 1..=3 {
+            cache.insert(key, 10 * key);
+        }
+        assert_eq!(cache.peek_next(0, |key, value, weight| (*key, *value, weight)), Some((1, 10, 1)));
+        // A refusal evicts nothing, and no entry but the next is offered.
+        assert_eq!(cache.evict_next_if(0, |key, _| *key == 2), None);
+        assert_eq!(cache.usage(), 3);
+        assert_eq!(cache.evict_next_if(0, |key, _| *key == 1), Some(1));
+        assert!(!cache.contains(&1));
+        assert_eq!(cache.usage(), 2);
+        // An entry a caller holds is not the next one.
+        let held = cache.get(&2).unwrap();
+        assert_eq!(cache.peek_next(0, |key, _, _| *key), Some(3));
+        assert_eq!(cache.evict_next_if(0, |_, _| true), Some(1));
+        assert_eq!(cache.peek_next(0, |key, _, _| *key), None);
+        drop(held);
+        assert_eq!(cache.peek_next(0, |key, _, _| *key), Some(2));
     }
 
     const CAPACITY: usize = 100;
